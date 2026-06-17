@@ -7,8 +7,10 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "justfile",
         "src",
         "dist",
+        "docs",
         "README.md",
         ".gitignore",
     },

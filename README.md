@@ -46,6 +46,21 @@ Requires Zig 0.16.0 or newer.
     zig build test         # run unit tests
     zig build check        # type-check without producing a binary
 
+### Task runner (just)
+
+A [`justfile`](justfile) wraps the common workflows so you don't have to
+remember the underlying commands (or the convention of running against a
+throwaway state file). It is optional — `just` is a language-agnostic command
+runner layered on top of `zig build`, not a replacement for it. Install with
+`brew install just`, then:
+
+    just              # list all recipes
+    just test         # run unit tests
+    just ci           # fmt-check + test + build (run this before pushing)
+    just demo         # baseline run + no-change run, against a temp state file
+    just run          # one real poll against a throwaway state file
+    just clean        # remove build artifacts and demo state
+
 ## Run
 
     ./zig-out/bin/fable-monitor
@@ -90,3 +105,18 @@ The source list, keywords, and per-source keyword overrides live at the top of
 `src/main.zig`. The Federal Register queries can be tightened or broadened by
 editing their query strings (the API supports filtering by agency, date,
 document type, and full-text term).
+
+## Documentation
+
+This README is the quick-start. Deeper technical documentation lives in
+[`docs/`](docs/):
+
+- [`docs/architecture.md`](docs/architecture.md) — components, data flow, and the run lifecycle.
+- [`docs/design-decisions.md`](docs/design-decisions.md) — why the tool is built the way it is (curl, single JSON state, fingerprinting, …).
+- [`docs/sources.md`](docs/sources.md) — the watched sources and how to add or tune one.
+- [`docs/state-format.md`](docs/state-format.md) — the state file schema and lifecycle.
+- [`docs/deployment.md`](docs/deployment.md) — running under launchd/cron, env vars, and the notify hook.
+- [`docs/development.md`](docs/development.md) — building, testing, and the documentation-maintenance policy.
+
+See [`docs/README.md`](docs/README.md) for the index and the policy that keeps
+these documents current.
