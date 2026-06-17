@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+fable_monitor_state.json
+*.log

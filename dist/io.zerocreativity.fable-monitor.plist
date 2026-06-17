@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.zerocreativity.fable-monitor</string>
+
+    <!-- Edit this path to the built binary. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/cipher009/Desktop/fable_monitor/zig-out/bin/fable-monitor</string>
+    </array>
+
+    <!-- Working directory; the default state file lands here if FABLE_MONITOR_STATE is unset. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/cipher009/Desktop/fable_monitor</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FABLE_MONITOR_STATE</key>
+        <string>/Users/cipher009/Desktop/fable_monitor/fable_monitor_state.json</string>
+        <key>FABLE_MONITOR_NOTIFY</key>
+        <string>osascript -e "display notification \"$1\" with title \"fable-monitor\""</string>
+        <!-- Ensure curl is resolvable. -->
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Poll every 30 minutes. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Also run once at load. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/cipher009/Desktop/fable_monitor/fable-monitor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/cipher009/Desktop/fable_monitor/fable-monitor.err.log</string>
+</dict>
+</plist>

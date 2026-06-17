@@ -1,0 +1,15 @@
+.{
+    .name = .fable_monitor,
+    .version = "0.1.0",
+    .fingerprint = 0x377dcb1ba8dbf13a,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "dist",
+        "README.md",
+        ".gitignore",
+    },
+}
