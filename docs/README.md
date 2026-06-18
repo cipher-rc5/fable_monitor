@@ -48,7 +48,7 @@ current, we follow three rules:
 | `src/banner.zig`, the `banner` subcommand, or the bundled font in `src/assets/` | [banner.md](banner.md) |
 | Why a dependency / approach was chosen (e.g. dropping curl, adding a real HTTP client) | [design-decisions.md](design-decisions.md) |
 | Env vars, the notify hook, the plist, or scheduling | [deployment.md](deployment.md), and the README |
-| `build.zig`, `build.zig.zon`, the `justfile`, tests, or CI | [development.md](development.md) |
+| `build.zig`, `build.zig.zon`, the `justfile`, tests, CI, `src/stats.zig`, or resource measurement | [development.md](development.md) |
 
 ---
 

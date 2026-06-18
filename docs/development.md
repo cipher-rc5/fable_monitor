@@ -32,10 +32,12 @@ src/events.zig       # Event model, event kinds, isoUtc, appendLog
 src/zstd.zig         # compress/decompress/compressor (system zstd binary)
 src/export.zig       # exportParquet and the per-table export helpers
 src/view.zig         # the `log` subcommand: formatted terminal reader
+src/stats.zig        # opt-in getrusage self-report (FABLE_MONITOR_STATS=1)
 src/parquet.zig      # minimal std-only Parquet writer (used by `export`)
 src/banner.zig       # from-scratch TrueType rasterizer (the `banner` subcommand)
 src/assets/          # bundled font (ManufacturingConsent-Regular.ttf) + OFL.txt
-dist/                # launchd plist template
+dist/                # launchd plist template + install/uninstall scripts
+scripts/             # standalone tooling (analyze.py — resource analysis)
 docs/                # this documentation set
 .github/workflows/   # CI
 ```
@@ -87,6 +89,10 @@ The most useful:
 | `just demo` | Baseline run + no-change run against a temp state file. |
 | `just run` | One real poll against a throwaway state file. |
 | `just export` | Write Parquet tables (`events`, `state_seen`, `state_keyword_hashes`) to `./parquet`. |
+| `just install` / `just uninstall` | Install/remove the macOS launchd background agent (see [deployment.md](deployment.md)). |
+| `just status` / `just logs` | Inspect the installed agent's state and its alert/diagnostic logs. |
+| `just measure` | Peak RSS + CPU of each subcommand, one shot (see Resource usage below). |
+| `just analyze` | Aggregated resource stats over N samples + CSV (`scripts/analyze.py`). |
 | `just clean` | Remove `zig-out`, `.zig-cache`, the `parquet` export dir, and demo state. |
 
 The run/demo/notify recipes default `FABLE_MONITOR_STATE` to a `/tmp` path so
@@ -115,6 +121,59 @@ committed [`zls.json`](../zls.json) fixes this by enabling build-on-save against
 the `check` step, which makes ZLS evaluate `build.zig` and pick up the module —
 reload your editor/ZLS after first checkout for it to take effect. `zig build`
 and `zig build test` are unaffected either way.
+
+## Resource usage
+
+The tool is one-shot: each invocation is a fresh, short-lived process that
+allocates from a single arena and frees everything on exit (decision 8), so
+there is **no cross-run growth to chase** — what matters is per-invocation peak
+memory and CPU, plus on-disk growth of the log.
+
+Measure it with:
+
+```sh
+just measure        # builds ReleaseSafe, times each subcommand
+```
+
+It runs each subcommand under macOS `/usr/bin/time -l` (peak RSS, CPU) and then
+prints the built-in self-report, which **also** accounts for the `curl`/`zstd`
+child processes that `time -l` on the parent misses. Representative numbers
+(ReleaseSafe, ~2.7 MB binary):
+
+| Subcommand | Process peak RSS | Children (curl/zstd) | CPU | Wall |
+|---|---|---|---|---|
+| `banner` | ~2–4 MB | — | ~0.003s | instant |
+| `log` | ~2–4 MB | ~2 MB | ~0.005s | 0.01s |
+| `export` | ~2–4 MB | ~2 MB | ~0.06s | 0.08s |
+| `poll` | **~16–18 MB** | ~7.6 MB | ~0.2s | network-bound |
+
+For repeated, aggregated measurements (min/median/mean/max/stdev over N samples,
+plus CSV export for your own analysis), use the standalone
+[`scripts/analyze.py`](../scripts/analyze.py) — `just analyze`, or run it
+directly: `scripts/analyze.py --samples 15 --csv samples.csv`. It is pure
+stdlib, works on macOS and Linux, and sources its figures from the same
+`FABLE_MONITOR_STATS` self-report (so it captures the child processes too).
+
+The `poll` figure dominates because the arena holds every fetched body for the
+whole run (it never frees mid-run), so peak ≈ the sum of the fetched pages,
+bounded by the 16 MiB per-fetch cap in `httpGet`. Each poll lasts a few seconds
+then exits, so the scheduled agent's steady-state footprint is ~0.
+
+### Self-report in production
+
+Set `FABLE_MONITOR_STATS=1` and the program logs a one-line `getrusage` summary
+(process + children peak RSS and CPU) to stderr at the end of any run. Enabling
+it in the launchd agent (the plist's `EnvironmentVariables`) records each poll's
+footprint into the agent's `err.log` — handy for spotting a page that has grown
+pathologically large. The probe is `getrusage(2)`, so it costs nothing.
+
+### Disk
+
+State is capped (200 document numbers) so it stays tiny. The observation log
+grows with *events* (not poll frequency) — a baseline is ~2–3 KB compressed and
+it only grows when something actually changes; rotate it if it ever matters
+(see [data-export.md](data-export.md) / [design-decisions.md](design-decisions.md)
+decision 9).
 
 ## Documentation maintenance (read before changing behavior)
 

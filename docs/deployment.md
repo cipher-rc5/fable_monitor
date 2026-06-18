@@ -25,6 +25,7 @@ notify hook.
 | `FABLE_MONITOR_STATE` | recommended | Absolute path to the compressed JSONL state file. Defaults to `fable_monitor_state.jsonl.zst` in the working directory — fine for manual runs, but always set it explicitly under a scheduler. See [state-format.md](state-format.md). |
 | `FABLE_MONITOR_LOG` | recommended | Absolute path to the observation log (compressed JSONL). Defaults to `fable_monitor_events.jsonl.zst` in the working directory. Set it explicitly under a scheduler so the history accrues in a known location; it is the input to `export`. See [data-export.md](data-export.md). |
 | `FABLE_MONITOR_NOTIFY` | optional | Shell command run on high-signal alerts. The alert text is passed as `$1` (injection-safe). |
+| `FABLE_MONITOR_STATS` | optional | If set (e.g. `=1`), log a `getrusage` peak-RSS/CPU summary (process + curl/zstd children) to stderr at the end of each run. See [development.md](development.md) → Resource usage. |
 
 ### The notify hook
 
@@ -53,29 +54,51 @@ FABLE_MONITOR_NOTIFY='echo ">>> NOTIFY: $1"' FABLE_MONITOR_STATE=/tmp/fm.json zi
 
 ## macOS (launchd)
 
-A ready template lives at `dist/io.zerocreativity.fable-monitor.plist`. Its
-paths are already set for this checkout; if you move the project, update the
-binary path, `WorkingDirectory`, `FABLE_MONITOR_STATE`, `FABLE_MONITOR_LOG`, and
-the two log paths.
+The easiest path is the installer, which builds a release binary, stages it
+under `~/Library/Application Support/fable-monitor/`, generates the LaunchAgent,
+validates it (`plutil -lint`), and loads it:
 
 ```sh
-cp dist/io.zerocreativity.fable-monitor.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/io.zerocreativity.fable-monitor.plist
+bash dist/install.sh        # or: just install
+just status                 # loaded? last exit code?
+just log                    # read the agent's collected history (formatted)
+just logs                   # tail the alert/diagnostic logs
+bash dist/uninstall.sh      # or: just uninstall — unload and remove
 ```
 
-Key fields in the plist:
+**Why Application Support, not the checkout?** On modern macOS, `~/Desktop`,
+`~/Documents`, and `~/Downloads` are TCC-protected. A background launchd agent
+can't answer the consent prompt, so launching a binary from there hangs in the
+loader (`open()`), `last exit code` never set. Staging the binary, state, log,
+and stdout/stderr under Application Support (not protected) lets it run
+unattended. The agent's data therefore lives at
+`~/Library/Application Support/fable-monitor/` — `just log` reads it from there.
 
-- `StartInterval` `1800` — poll every 30 minutes.
+Tunables:
+
+- `FABLE_INTERVAL=<seconds> bash dist/install.sh` overrides the poll cadence
+  (default 1800 = 30 min).
+- The installer prefers `terminal-notifier` (more reliable from a background
+  agent) and falls back to `osascript`. `bash dist/install.sh --dry-run` prints
+  the plist it would write without installing.
+
+The generated agent sets:
+
+- `StartInterval` — poll every `FABLE_INTERVAL` seconds.
 - `RunAtLoad` `true` — also run once immediately on load.
+- `EnvironmentVariables` — `FABLE_MONITOR_STATE` / `_LOG` / `_NOTIFY`, plus a
+  `PATH` that includes the directories where this machine's `curl` and `zstd`
+  live (resolved at install time).
 - `StandardOutPath` / `StandardErrorPath` — alerts (stdout) and diagnostics
-  (stderr) are logged separately.
-- `PATH` includes `/opt/homebrew/bin` so a Homebrew `curl`/notifier resolves.
+  (stderr), logged separately under Application Support.
 
-To stop:
+### Manual / reference
 
-```sh
-launchctl unload ~/Library/LaunchAgents/io.zerocreativity.fable-monitor.plist
-```
+`dist/io.zerocreativity.fable-monitor.plist` is a hand-editable reference plist
+(with `/path/to/fable_monitor` placeholders). To use it directly, replace the
+placeholders, `cp` it to `~/Library/LaunchAgents/`, and
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.zerocreativity.fable-monitor.plist`
+(or the legacy `launchctl load -w`). The installer above does this for you.
 
 After editing the plist you must `unload` then `load` again for changes to take
 effect. Validate edits with `plutil -lint <file>`.

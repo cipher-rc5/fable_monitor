@@ -101,6 +101,11 @@ Or with osascript and no extra install:
 
     export FABLE_MONITOR_NOTIFY='osascript -e "display notification \"$1\" with title \"fable-monitor\""'
 
+`FABLE_MONITOR_STATS`, if set, makes each run log a one-line peak-memory/CPU
+summary (process + `curl`/`zstd` children) to stderr. Use `just measure` to
+profile all subcommands; see [`docs/development.md`](docs/development.md) →
+Resource usage.
+
 ## Reading the data
 
 Every poll records what it found to the observation log (compressed JSONL), so
@@ -154,18 +159,37 @@ dependency) and printed as Unicode half-blocks; the font is embedded in the
 binary, so `banner` needs no network, files, `curl`, or `zstd`. Details are in
 [`docs/banner.md`](docs/banner.md).
 
-## Scheduling on macOS (launchd)
+## Run it in the background (macOS launchd)
 
-A sample agent is in `dist/io.zerocreativity.fable-monitor.plist`. Edit the
-paths inside it, then:
+The intended use: a scheduled agent that polls in the background and notifies you
+on a relevant change. An installer scripts the whole thing — it builds a release
+binary, stages it (and its state/log) under
+`~/Library/Application Support/fable-monitor/`, generates a LaunchAgent, and
+loads it:
 
-    cp dist/io.zerocreativity.fable-monitor.plist ~/Library/LaunchAgents/
-    launchctl load ~/Library/LaunchAgents/io.zerocreativity.fable-monitor.plist
+    just install            # or: bash dist/install.sh
+    just status             # is it loaded? last exit code?
+    just log                # read the agent's collected history (formatted table)
+    just logs               # tail alert (stdout) + diagnostic (stderr) logs
+    just uninstall          # stop and remove
 
-It runs every 30 minutes. Logs are written to the paths set in the plist. To
-stop:
+(The binary is staged under Application Support, not run from this checkout,
+because macOS TCC-protects `~/Desktop`/`~/Documents`/`~/Downloads` — a background
+agent can't satisfy the consent prompt there and would hang at launch.)
 
-    launchctl unload ~/Library/LaunchAgents/io.zerocreativity.fable-monitor.plist
+It polls every 30 minutes (and once immediately). Change the cadence with
+`FABLE_INTERVAL` (seconds):
+
+    FABLE_INTERVAL=600 just install      # every 10 minutes
+
+Notifications fire only on high-signal alerts (a `[RELEVANT]` Federal Register
+document or a watched-page change). The installer uses
+[`terminal-notifier`](https://github.com/julienXX/terminal-notifier) if present
+(more reliable from a background agent — `brew install terminal-notifier`),
+otherwise the built-in `osascript`; macOS may ask you to allow notifications the
+first time. To preview the generated agent without installing: `just
+install-preview`. The plist at `dist/io.zerocreativity.fable-monitor.plist` is a
+hand-editable reference; `just install` generates the real one for you.
 
 ## Tuning
 
