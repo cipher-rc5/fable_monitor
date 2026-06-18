@@ -1,4 +1,81 @@
+# ---------------------------------------------------------------------------
+# Zig build artifacts
+# ---------------------------------------------------------------------------
 .zig-cache/
 zig-out/
-fable_monitor_state.json
+
+# ---------------------------------------------------------------------------
+# fable-monitor runtime data — regenerated each run, never committed.
+# (See docs/state-format.md and docs/data-export.md.)
+# ---------------------------------------------------------------------------
+# State snapshot + observation log, any extension: current `.jsonl.zst` and
+# legacy `.json` / `.ndjson` alike.
+fable_monitor_state*
+fable_monitor_events*
+# Parquet exports (default ./parquet from the `export` subcommand).
+parquet/
+*.parquet
+# zstd staging temp files (see zstdFilter in src/main.zig).
+*.ztmp
+# launchd / cron stdout + stderr logs.
 *.log
+
+# ---------------------------------------------------------------------------
+# Environment & secrets — never commit credentials or local overrides.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ---------------------------------------------------------------------------
+# Linux
+# ---------------------------------------------------------------------------
+.directory
+.fuse_hidden*
+.nfs*
+
+# ---------------------------------------------------------------------------
+# Windows
+# ---------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Editors & IDEs
+# ---------------------------------------------------------------------------
+# VS Code
+.vscode/
+# JetBrains (CLion, etc.)
+.idea/
+*.iml
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+Session.vim
+# Emacs
+*~
+\#*\#
+.\#*
+# Sublime Text
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+*.tmp
+*.bak
+*.core
+vgcore.*

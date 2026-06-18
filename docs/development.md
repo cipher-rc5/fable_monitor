@@ -1,6 +1,6 @@
 # Development
 
-Last reviewed: 2026-06-17 · against fable-monitor 0.1.0
+Last reviewed: 2026-06-18 · against fable-monitor 0.1.0 (reviewed after the src/ modularization)
 
 How to build, test, and contribute to `fable-monitor`, plus the policy that
 keeps this documentation current.
@@ -9,15 +9,32 @@ keeps this documentation current.
 
 - **Zig 0.16.0 or newer** (pinned via `minimum_zig_version` in `build.zig.zon`).
 - **`curl`** on `PATH` — only needed to *run* a live poll, not to build or test.
+- **`zstd`** on `PATH` — needed to *run* either mode (the tool compresses its
+  state, log, and Parquet outputs with it); not needed to build or test.
+  `brew install zstd` on macOS if missing.
 - **`just`** (optional) — task runner; `brew install just`.
+- **`duckdb`** (optional) — handy for verifying Parquet output end-to-end.
 
 ## Project layout
 
 ```
-build.zig            # build graph: exe, run, test, check steps
+build.zig            # build graph: exe, run, test, check, build_options
 build.zig.zon        # package manifest (name, version, min Zig, fingerprint)
+LICENSE              # MIT license
 justfile             # task-runner recipes (wraps zig build + conventions)
-src/main.zig         # the entire program (single file)
+src/main.zig         # CLI entrypoint: arg dispatch, poll loop, alerting, test root
+src/context.zig      # shared per-run Context type and the log helper
+src/sources.zig      # Source/SourceKind, the sources array, keywords
+src/fetch.zig        # httpGet + toolAvailable (network I/O via curl)
+src/html.zig         # normalizeHtml, extractKeywordContext, containsAny (pure text)
+src/state.zig        # State, loadState/saveState, capTail
+src/events.zig       # Event model, event kinds, isoUtc, appendLog
+src/zstd.zig         # compress/decompress/compressor (system zstd binary)
+src/export.zig       # exportParquet and the per-table export helpers
+src/view.zig         # the `log` subcommand: formatted terminal reader
+src/parquet.zig      # minimal std-only Parquet writer (used by `export`)
+src/banner.zig       # from-scratch TrueType rasterizer (the `banner` subcommand)
+src/assets/          # bundled font (ManufacturingConsent-Regular.ttf) + OFL.txt
 dist/                # launchd plist template
 docs/                # this documentation set
 .github/workflows/   # CI
@@ -29,7 +46,7 @@ docs/                # this documentation set
 |---|---|---|
 | install | `zig build` | Compile and install `zig-out/bin/fable-monitor`. |
 | run | `zig build run` | Build, then run one poll. Forwards extra args. |
-| test | `zig build test` | Compile and run the unit tests in `src/main.zig`. |
+| test | `zig build test` | Compile and run the unit tests. `src/main.zig` is the test root and references every sibling module, so each module's own tests run. |
 | check | `zig build check` | Type-check only, no binary — fast feedback / LSP. |
 
 The exe, test, and check targets all share one `root_module`, so they stay in
@@ -37,11 +54,19 @@ sync automatically.
 
 ## Tests
 
-Unit tests live at the bottom of `src/main.zig` and cover the pure logic
-(`normalizeHtml`, `containsAny`, `extractKeywordContext`, `capTail`, and the
-`State` lookups). They need no network. The I/O paths (curl, state file, notify)
-are exercised end-to-end by running the binary — see `just demo`,
-`just test-notify`, and `just test-no-curl`.
+Unit tests live next to the code they cover. `src/html.zig` covers the pure text
+logic (`normalizeHtml`, `containsAny`, `extractKeywordContext`) and `src/state.zig`
+covers `capTail` and the `State` lookups; `src/parquet.zig` adds tests for the
+Parquet encoder's primitives (zigzag varints, compact field headers, the file
+envelope). `src/main.zig` is the test root: its `test {}` block references every
+module (`_ = parquet;`, `_ = @import("html.zig");`, …) so all of those tests run
+under `zig build test`. They need no network. The I/O paths (curl, state file,
+notify) are exercised end-to-end by running the binary — see `just demo`,
+`just test-notify`, and `just test-no-deps`.
+
+Parquet **format** correctness can't be checked by std-only Zig (it can't parse
+Parquet back), so verify it by reading an exported file with a real reader; the
+recipe is in [data-export.md](data-export.md).
 
 ```sh
 zig build test --summary all     # or: just test
@@ -61,7 +86,8 @@ The most useful:
 | `just ci` | `fmt-check` + `test` + `build` — the full pre-push gate. |
 | `just demo` | Baseline run + no-change run against a temp state file. |
 | `just run` | One real poll against a throwaway state file. |
-| `just clean` | Remove `zig-out`, `.zig-cache`, and demo state. |
+| `just export` | Write Parquet tables (`events`, `state_seen`, `state_keyword_hashes`) to `./parquet`. |
+| `just clean` | Remove `zig-out`, `.zig-cache`, the `parquet` export dir, and demo state. |
 
 The run/demo/notify recipes default `FABLE_MONITOR_STATE` to a `/tmp` path so
 development runs never touch real scheduled state.
@@ -79,6 +105,17 @@ gate before pushing.
 `zig fmt` is the authority; CI enforces `zig fmt --check`. Use `just fmt` to
 format in place before committing.
 
+## Editor / language server (ZLS)
+
+The version string is injected by `build.zig` as a generated `build_options`
+module (`@import("build_options")` in `src/main.zig`; see the Releasing section).
+That module only exists once `build.zig` runs, so a language server that
+analyzes the source statically reports *"no module named 'build_options'"*. The
+committed [`zls.json`](../zls.json) fixes this by enabling build-on-save against
+the `check` step, which makes ZLS evaluate `build.zig` and pick up the module —
+reload your editor/ZLS after first checkout for it to take effect. `zig build`
+and `zig build test` are unaffected either way.
+
 ## Documentation maintenance (read before changing behavior)
 
 Documentation is treated as part of the change, not a follow-up. The full policy
@@ -95,8 +132,10 @@ here and in [docs/README.md](README.md).
 
 ## Releasing
 
-1. Bump `version` in both `build.zig.zon` and the `version` constant in
-   `src/main.zig` (they should match).
+1. Bump `version` in `build.zig.zon` only — it is the single source of truth.
+   `build.zig` generates a `build_options` module from `build.zig.zon`'s
+   `version`, and the binary reads it via `@import("build_options").version`, so
+   there is no second constant to keep in sync.
 2. Run `just ci`.
 3. Skim every doc in `docs/` and refresh the `Last reviewed:` stamps.
 4. Tag the release.

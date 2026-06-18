@@ -12,6 +12,8 @@ go deeper into how the tool works and *why* it is built the way it is.
 | [design-decisions.md](design-decisions.md) | Rationale for the major choices (ADR-style). |
 | [sources.md](sources.md) | The watched sources and how to add or tune one. |
 | [state-format.md](state-format.md) | The JSON state file: schema, lifecycle, capping. |
+| [data-export.md](data-export.md) | The observation log and the `export` subcommand (NDJSON → Parquet). |
+| [banner.md](banner.md) | The `banner` subcommand (renders text with the bundled TrueType font). |
 | [deployment.md](deployment.md) | Running under launchd/cron, env vars, the notify hook. |
 | [development.md](development.md) | Build, test, the justfile, and the doc-maintenance policy. |
 
@@ -39,13 +41,15 @@ current, we follow three rules:
 
 | If you change… | Update… |
 |---|---|
-| The `sources` array, `keywords`, or `Source`/`SourceKind` in `src/main.zig` | [sources.md](sources.md), and the "What it watches" section of the top-level README |
-| The `State` struct, `capTail`, or `loadState`/`saveState` | [state-format.md](state-format.md) |
-| `httpGet`, `curlAvailable`, `extractKeywordContext`, `normalizeHtml`, or the run flow in `main` | [architecture.md](architecture.md) |
+| The `sources` array, `keywords`, or `Source`/`SourceKind` in `src/sources.zig` | [sources.md](sources.md), and the "What it watches" section of the top-level README |
+| The `State` struct, `capTail`, or `loadState`/`saveState` in `src/state.zig` | [state-format.md](state-format.md) |
+| `src/parquet.zig`, the `Event` struct (`src/events.zig`), `events.appendLog`, `src/export.zig` (`exportParquet`), `src/view.zig` (the `log` reader), or the `export`/`log` subcommands | [data-export.md](data-export.md) |
+| `httpGet`/`toolAvailable` (`src/fetch.zig`), the `zstd.*` helpers (`src/zstd.zig`), `extractKeywordContext`/`normalizeHtml` (`src/html.zig`), or the poll flow in `src/main.zig` | [architecture.md](architecture.md) |
+| `src/banner.zig`, the `banner` subcommand, or the bundled font in `src/assets/` | [banner.md](banner.md) |
 | Why a dependency / approach was chosen (e.g. dropping curl, adding a real HTTP client) | [design-decisions.md](design-decisions.md) |
 | Env vars, the notify hook, the plist, or scheduling | [deployment.md](deployment.md), and the README |
 | `build.zig`, `build.zig.zon`, the `justfile`, tests, or CI | [development.md](development.md) |
 
 ---
 
-Last reviewed: 2026-06-17 · against fable-monitor 0.1.0
+Last reviewed: 2026-06-18 · against fable-monitor 0.1.0

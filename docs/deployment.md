@@ -1,6 +1,6 @@
 # Deployment
 
-Last reviewed: 2026-06-17 · against fable-monitor 0.1.0
+Last reviewed: 2026-06-18 · against fable-monitor 0.1.0
 
 `fable-monitor` does one poll per invocation and exits, so deployment means
 "have a scheduler run the binary on an interval." This document covers the
@@ -12,13 +12,18 @@ notify hook.
 - A built binary: `zig build` → `zig-out/bin/fable-monitor`.
 - `curl` on the `PATH` the scheduler uses (the binary preflights this and exits
   with a clear message if it's missing).
-- A writable, absolute state-file path.
+- `zstd` on the same `PATH` — the binary compresses its state, log, and Parquet
+  outputs with it and preflights it in both modes (clear message if missing).
+  Preinstalled on recent macOS/Linux; `brew install zstd` / your package manager
+  otherwise.
+- Writable, absolute state-file and log-file paths.
 
 ## Environment variables
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `FABLE_MONITOR_STATE` | recommended | Absolute path to the JSON state file. Defaults to `fable_monitor_state.json` in the working directory — fine for manual runs, but always set it explicitly under a scheduler. See [state-format.md](state-format.md). |
+| `FABLE_MONITOR_STATE` | recommended | Absolute path to the compressed JSONL state file. Defaults to `fable_monitor_state.jsonl.zst` in the working directory — fine for manual runs, but always set it explicitly under a scheduler. See [state-format.md](state-format.md). |
+| `FABLE_MONITOR_LOG` | recommended | Absolute path to the observation log (compressed JSONL). Defaults to `fable_monitor_events.jsonl.zst` in the working directory. Set it explicitly under a scheduler so the history accrues in a known location; it is the input to `export`. See [data-export.md](data-export.md). |
 | `FABLE_MONITOR_NOTIFY` | optional | Shell command run on high-signal alerts. The alert text is passed as `$1` (injection-safe). |
 
 ### The notify hook
@@ -50,7 +55,8 @@ FABLE_MONITOR_NOTIFY='echo ">>> NOTIFY: $1"' FABLE_MONITOR_STATE=/tmp/fm.json zi
 
 A ready template lives at `dist/io.zerocreativity.fable-monitor.plist`. Its
 paths are already set for this checkout; if you move the project, update the
-binary path, `WorkingDirectory`, `FABLE_MONITOR_STATE`, and the two log paths.
+binary path, `WorkingDirectory`, `FABLE_MONITOR_STATE`, `FABLE_MONITOR_LOG`, and
+the two log paths.
 
 ```sh
 cp dist/io.zerocreativity.fable-monitor.plist ~/Library/LaunchAgents/
@@ -81,7 +87,8 @@ on a schedule with the env vars set and an absolute state path. Example crontab
 entry polling every 30 minutes:
 
 ```cron
-*/30 * * * * FABLE_MONITOR_STATE=/var/lib/fable-monitor/state.json \
+*/30 * * * * FABLE_MONITOR_STATE=/var/lib/fable-monitor/state.jsonl.zst \
+  FABLE_MONITOR_LOG=/var/lib/fable-monitor/events.jsonl.zst \
   FABLE_MONITOR_NOTIFY='notify-send "fable-monitor" "$1"' \
   /opt/fable-monitor/zig-out/bin/fable-monitor >> /var/log/fable-monitor.log 2>&1
 ```

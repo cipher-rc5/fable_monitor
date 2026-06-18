@@ -1,9 +1,9 @@
 # Sources
 
-Last reviewed: 2026-06-17 · against fable-monitor 0.1.0
+Last reviewed: 2026-06-18 · against fable-monitor 0.1.0
 
 A *source* is one thing the monitor polls. The full list lives in the `sources`
-array at the top of `src/main.zig`, alongside the `keywords` constant and the
+array in `src/sources.zig`, alongside the `keywords` constant and the
 `Source` / `SourceKind` definitions. This document explains the model and how to
 add or tune a source.
 
@@ -56,7 +56,7 @@ domain and would make the entire page count as keyword context.
 
 ## Adding a source
 
-1. Append an entry to the `sources` array in `src/main.zig`.
+1. Append an entry to the `sources` array in `src/sources.zig`.
 2. Give it a **unique, stable `id`** — it keys the source's data in the state
    file and appears in logs. Changing an existing `id` orphans its stored state
    (the next run treats it as brand new and re-baselines).

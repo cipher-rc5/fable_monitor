@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Single-source the version: read it from build.zig.zon and expose it to
+    // the program as `build_options.version`. The exe, test, and check targets
+    // all share `root_module`, so attaching here covers all three.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    root_module.addOptions("build_options", options);
+
     const exe = b.addExecutable(.{
         .name = "fable-monitor",
         .root_module = root_module,
