@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const parquet = @import("parquet.zig");
 const banner = @import("banner.zig");
 const view = @import("view.zig");
+const stats = @import("stats.zig");
 const context = @import("context.zig");
 const Context = context.Context;
 const log = context.log;
@@ -64,6 +65,11 @@ pub fn main(init: std.process.Init) !void {
         .observed_at = try events.isoUtc(arena, now.toSeconds()),
         .epoch_ms = now.toMilliseconds(),
     };
+
+    // Optional resource self-report (FABLE_MONITOR_STATS=1), logged at the end
+    // of any subcommand via this defer.
+    const stats_on = init.environ_map.get("FABLE_MONITOR_STATS") != null;
+    defer if (stats_on) stats.report();
 
     // Argument vector: argv[0] is the program name; argv[1] is an optional
     // subcommand. With no subcommand we poll (the default behavior).
@@ -286,6 +292,7 @@ test {
     _ = parquet;
     _ = banner;
     _ = view;
+    _ = stats;
     _ = @import("html.zig");
     _ = @import("state.zig");
     _ = @import("events.zig");
