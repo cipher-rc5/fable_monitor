@@ -31,8 +31,13 @@ fmt-check:
 fmt:
     zig fmt src/ build.zig
 
+# End-to-end fixture replay: proves the full pipeline trips on a simulated
+# restoration and stays silent on baseline/decoy. Builds first.
+e2e: build
+    bash tests/e2e.sh
+
 # Everything CI runs, in order. Run this before pushing.
-ci: fmt-check test build
+ci: fmt-check test build e2e
 
 # Run one real poll against throwaway state/log files (safe; won't touch real state).
 run:
@@ -52,6 +57,14 @@ export out_dir="parquet":
 log *args:
     FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" zig build run -- log {{args}}
 
+# Dataview of the installed agent's recent activity: last 90 days, newest-first.
+# Same reader/flags as `log`, just a different preset.
+# Usage: just view                        (last 90 days, newest-first)
+#        just view --relevant             (only high-signal events)
+#        just view --days 30 --source fr_bis
+view *args:
+    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" zig build run -- view {{args}}
+
 # Inspect a compressed JSONL file (state or log): decompress and pretty-print.
 # Usage: just inspect /path/to/file.jsonl.zst   (pipe through jq if installed)
 inspect file:
@@ -69,6 +82,42 @@ demo:
 test-notify:
     rm -f {{demo_state}} {{demo_log}}
     FABLE_MONITOR_NOTIFY='echo ">>> NOTIFY FIRED: $1"' FABLE_MONITOR_STATE={{demo_state}} FABLE_MONITOR_LOG={{demo_log}} zig build run
+
+# Replay the restoration fixtures against a throwaway state and show the trip
+# (structured events on stdout + notify hook firing). Safe; touches no real state.
+demo-restore: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    S=$(mktemp); L=$(mktemp)
+    export FABLE_MONITOR_STATE="$S" FABLE_MONITOR_LOG="$L"
+    export FABLE_MONITOR_ONLY="anthropic_model_list,anthropic_pricing,anthropic_statement,fr_pi_bis"
+    export FABLE_MONITOR_NOTIFY='echo ">>> NOTIFY: $1"'
+    echo "== baseline (no trip) =="
+    FABLE_MONITOR_FIXTURES=tests/fixtures/baseline ./zig-out/bin/fable-monitor poll | grep '^{' || true
+    echo "== restored (tier-1 trip) =="
+    FABLE_MONITOR_FIXTURES=tests/fixtures/restored ./zig-out/bin/fable-monitor poll | grep '^{'
+    rm -f "$S" "$L"
+
+# Verify the runtime is ready (deps, state path, egress, secrets) before scheduling.
+preflight:
+    zig build run -- preflight
+
+# Coverage audit: each source's last successful fetch and last detected change.
+audit:
+    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" FABLE_MONITOR_STATE=~/"Library/Application Support/fable-monitor/state.jsonl.zst" zig build run -- audit
+
+# Install as a Linux recurring job (Zo.computer / systemd / cron). Override:
+# SCHEDULER=systemd|cron  FABLE_HOME=/persistent/path  FABLE_FAST_INTERVAL=45
+install-linux:
+    bash dist/install-linux.sh
+
+# Preview the Linux scheduler install without writing anything.
+install-linux-preview:
+    bash dist/install-linux.sh --dry-run
+
+# Remove the Linux scheduler job (leaves binary/state/logs).
+uninstall-linux:
+    bash dist/uninstall-linux.sh
 
 # Verify the missing-dependency preflight produces a clear error. With an empty
 # PATH the zstd preflight fires first (it runs before the curl check).
@@ -124,7 +173,7 @@ measure:
 # optional CSV export. Standalone script; extra args pass through.
 # Usage: just analyze            ·  just analyze --samples 15 --csv out.csv
 analyze *args:
-    scripts/analyze.py {{args}}
+    uv run scripts/analyze.py {{args}}
 
 # Remove build artifacts, demo state/log, and the default Parquet export dir.
 clean:

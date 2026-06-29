@@ -7,7 +7,7 @@ fable-monitor banner [text] [height]
 ```
 
 Prints `FABLE` (or any `text` you pass) as a large terminal banner drawn with a
-real TrueType font — the bundled blackletter face *Manufacturing Consent*. It is
+real TrueType font, the bundled blackletter face *Manufacturing Consent*. It is
 a bit of flourish for the tool's namesake; it does not poll, touch the network,
 or read/write any files, so it needs neither `curl` nor `zstd`.
 
@@ -26,17 +26,17 @@ fable-monitor banner FABLE 16      # shorter
 
 ## How it works
 
-There is **no font or graphics dependency** — `src/banner.zig` parses the
+There is **no font or graphics dependency**, `src/banner.zig` parses the
 TrueType outlines and rasterizes them itself, in the same std-only,
 build-it-from-scratch spirit as [`src/parquet.zig`](data-export.md). The font is
 embedded into the binary with `@embedFile`, so the subcommand works anywhere.
 
 The pipeline:
 
-1. **Parse the sfnt tables** — `head` (units/em, loca format), `maxp`, `hhea`,
+1. **Parse the sfnt tables**, `head` (units/em, loca format), `maxp`, `hhea`,
    `hmtx` (advance widths), a format-4 `cmap` (code point → glyph id), `loca`,
    and `glyf`.
-2. **Decode simple glyph outlines** — contours of on/off-curve points. Only
+2. **Decode simple glyph outlines**, contours of on/off-curve points. Only
    simple glyphs are handled (the Latin capitals in this font are all simple;
    composite glyphs are skipped).
 3. **Flatten quadratic Béziers** to line segments, inserting the implied
@@ -44,12 +44,12 @@ The pipeline:
 4. **Rasterize** with a scanline fill using the **non-zero winding rule**, which
    correctly leaves the counters (the holes in `A`, `B`, …) empty.
 5. **Emit half-blocks** (`▀ ▄ █`) so each character cell carries two vertical
-   pixels — this doubles vertical resolution and makes the pixels roughly square
+   pixels, this doubles vertical resolution and makes the pixels roughly square
    in a normal terminal.
 
 Scope is deliberately small: one row group of capitals at a handful of sizes.
 It is not a general font renderer (no hinting, kerning, composite glyphs, or
-sub-pixel antialiasing) — see [design-decisions.md](design-decisions.md).
+sub-pixel antialiasing), see [design-decisions.md](design-decisions.md).
 
 ## The bundled font & its license
 

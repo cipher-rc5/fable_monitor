@@ -1,31 +1,39 @@
 # fable-monitor
 
-Zig 0.16 command-line tool that polls official sources for changes to
-the US government export-control status of Anthropic's Fable 5 and Mythos 5
-models, and alerts when something moves.
+Zig 0.16 command-line tool that polls public sources for the restoration of US
+government export-control access to Anthropic's Fable 5 and Mythos 5 models, and
+emits a verified, low-latency signal when access comes back.
 
-It is built to run as a scheduled job (launchd or cron). Each invocation is one
-poll: it fetches each source, diffs against the previous run's state, prints any
-changes to stdout, optionally fires a notification hook, and persists updated
-state.
+It runs as a scheduled job (launchd, systemd, or cron). Each invocation is one
+poll: it fetches the sources that are due this tick, runs a per-kind detector,
+coalesces corroborating signals into one alert, persists updated state, and on a
+trip emits a structured JSON event (and optionally fires a notification hook).
+The monitor's job ends at emitting the verified signal; any system that acts on
+it lives in a separate process.
 
 ## What it watches
 
-Two classes of source:
+Sources are described by a JSON config (an embedded default, overridable via
+`FABLE_MONITOR_SOURCES`) and graded into three confidence tiers. The default
+config ships 11 sources, including three independent tier-1 trippers so there is
+no single point of failure in the decisive path.
 
-1. Federal Register JSON API (the reliable signal). Two feeds are polled: every
-   document whose full text matches the term "Anthropic", and every rule from
-   the Bureau of Industry and Security (BIS), the agency that issued the
-   directive. New document numbers are reported; documents whose title contains
-   a watched keyword (fable, mythos, anthropic) are tagged `[RELEVANT]`.
+- **Tier 1 (decisive, lowest latency).** The public model listing and pricing
+  page (a `model_list_probe` detects an absent-to-present transition of
+  `claude-fable-5` / `claude-mythos-5`, the single most decisive confirmation
+  that access is live) and the access-statement page (a `statement_watch` trips
+  on restoration vocabulary). A tier-1 change trips immediately at high
+  confidence.
+- **Tier 2 (official record).** The Federal Register documents and
+  public-inspection feeds (BIS rules and the term "Anthropic") and the BIS news
+  page, with a tightened relevance filter so a document must name Anthropic or a
+  specific model, not merely contain the word "fable".
+- **Tier 3 (early but noisy).** The Anthropic newsroom sitemap, a Google News
+  feed, and a prediction market. Advisory only; never auto-actioned on its own.
 
-2. HTML keyword watchers (best effort). The Anthropic newsroom and the BIS news
-   page are fetched, reduced to a normalized fingerprint of the text near each
-   watched keyword, and diffed. These catch announcements that never reach the
-   Federal Register, but they are inherently noisier than the structured feeds.
-
-The most likely "Fable is back" signal is an Anthropic newsroom change followed
-by a Federal Register action, so weight the structured feeds highest.
+A tier-2/3 advisory is promoted to high confidence when a second distinct source
+corroborates it on the same event identity. Full details, the config format, and
+every source kind are in [`docs/sources.md`](docs/sources.md).
 
 ## Design notes
 
@@ -33,17 +41,23 @@ The tool is std-only Zig with two external binaries: `curl` for fetching, and
 `zstd` for compressing its outputs. Delegating to these sidesteps the churn in
 Zig's in-tree TLS/HTTP client and the fact that std ships no zstd *compressor*,
 and both binaries are widely available. Everything else (JSON parsing,
-normalization, hashing, state, and a from-scratch Parquet writer) is standard
-library.
+normalization, hashing, state, RSS/Atom/sitemap parsing, and a from-scratch
+Parquet writer) is standard library.
 
-State is a single file — zstd-compressed line-delimited JSON. The Federal
-Register seen-set is capped at the most recent 200 document numbers so it does
-not grow without bound.
+Each poll sends conditional requests (ETag / If-Modified-Since) so unchanged
+sources return 304 cheaply, and only polls sources that are *due*: tier-1 on a
+fast loop, tier-2/3 on a slow loop. State is a single zstd-compressed
+line-delimited JSON file (format v2; v1 files still load). The Federal Register
+seen-set is capped at the most recent 300 document numbers so it does not grow
+without bound.
+
+> Fetching is serial in this build; the config's `concurrency` field is reserved
+> for a future parallel-fetch build.
 
 Alongside the state snapshot, each poll records its findings to an observation
 log (compressed JSONL), giving a queryable history of what changed and when. The
 `export` subcommand projects that log and the current state into (ZSTD-coded)
-Parquet tables for analysis — see [Reading the data](#reading-the-data)
+Parquet tables for analysis, see [Reading the data](#reading-the-data)
 below and [`docs/data-export.md`](docs/data-export.md).
 
 ## Build
@@ -59,7 +73,7 @@ Requires Zig 0.16.0 or newer.
 
 A [`justfile`](justfile) wraps the common workflows so you don't have to
 remember the underlying commands (or the convention of running against a
-throwaway state file). It is optional — `just` is a language-agnostic command
+throwaway state file). It is optional, `just` is a language-agnostic command
 runner layered on top of `zig build`, not a replacement for it. Install with
 `brew install just`, then:
 
@@ -71,29 +85,76 @@ runner layered on top of `zig build`, not a replacement for it. Install with
     just export       # write Parquet tables to ./parquet
     just clean        # remove build artifacts and demo state
 
+## Commands
+
+The mode is selected by the first argument (default `poll`):
+
+| Command | Does |
+|---|---|
+| `poll` (default) | One poll pass over the due sources. |
+| `preflight` | Verify deps, state-path writability, per-source egress, and secrets before scheduling. |
+| `audit` | Each source's last successful fetch and last detected change (catch a quietly dead source). |
+| `ack <event_id>` | Acknowledge a fired alert so it stops escalating. |
+| `view` / `log` | Read the observation log as a formatted table (see below). |
+| `export [out_dir]` | Project the log + state into Parquet tables. |
+| `banner [text] [height]` | Render text as a TrueType terminal banner. |
+
+## Quickstart
+
+```sh
+zig build
+./zig-out/bin/fable-monitor preflight          # deps, state path, egress, secrets
+just demo-restore                               # offline fixture replay: baseline (silent) then a tier-1 trip
+```
+
+`just demo-restore` replays bundled fixtures (`FABLE_MONITOR_FIXTURES`) against a
+throwaway state file: the baseline run is silent, then the restored fixtures fire
+a tier-1 trip. On a trip the monitor emits a single-line structured JSON event to
+stdout (schema `fable-monitor.event/1`):
+
+```json
+{"schema":"fable-monitor.event/1","event_id":"model_present:claude-fable-5",
+ "kind":"restoration","tier":1,"confidence":"high","escalation":false,
+ "corroborating_sources":["anthropic_model_list","anthropic_pricing"],
+ "detected_at":"2026-06-28T14:03:09Z","epoch_ms":1782396189000,
+ "title":"Model claude-fable-5 present in public listing",
+ "evidence_url":"https://docs.anthropic.com/...","document_number":"","detail":"claude-fable-5"}
+```
+
+The event always goes to stdout; it is additionally appended to
+`FABLE_MONITOR_EVENT_SINK` and POSTed to `FABLE_MONITOR_WEBHOOK` when set. A
+downstream execution system consumes it in a separate process.
+
 ## Run
 
     ./zig-out/bin/fable-monitor
 
-Diagnostics go to stderr (prefixed `[fable-monitor]`); alerts go to stdout. On
-the first run every source records a baseline and reports no changes on
-subsequent runs until something actually shifts.
+Diagnostics (and a one-line per-run metrics summary) go to stderr (prefixed
+`[fable-monitor]`); structured events and alerts go to stdout. On the first run
+every source records a baseline and reports no changes on subsequent runs until
+something actually shifts.
 
 ### Environment variables
 
-`FABLE_MONITOR_STATE` sets the state file path. Defaults to
-`fable_monitor_state.jsonl.zst` in the working directory. Use an absolute path
-when running under a scheduler.
+The most common (the full reference is in
+[`docs/deployment.md`](docs/deployment.md)):
 
-`FABLE_MONITOR_LOG` sets the observation-log path. Defaults to
-`fable_monitor_events.jsonl.zst` in the working directory. Each poll records its
-findings here (zstd-compressed JSONL); this is the history the `export`
-subcommand reads. Use an absolute path under a scheduler.
+- `FABLE_MONITOR_STATE` / `FABLE_MONITOR_LOG`: absolute paths to the state file
+  and observation log. Set both explicitly under a scheduler.
+- `FABLE_MONITOR_SOURCES`: external JSON source config (overrides the embedded
+  default). `FABLE_MONITOR_ONLY` / `FABLE_MONITOR_DISABLE` toggle sources by id.
+- `FABLE_MONITOR_WEBHOOK` / `FABLE_MONITOR_EVENT_SINK`: extra sinks for the
+  structured event, beyond stdout.
+- `FABLE_MONITOR_HEARTBEAT_URL`: dead-man's-switch ping (healthchecks.io style),
+  so the monitor's own liveness is monitored.
+- `FABLE_MONITOR_FAST_INTERVAL` / `FABLE_MONITOR_LOOP` / `FABLE_MONITOR_FORCE`:
+  cadence controls.
+- `FABLE_MONITOR_ESCALATE_AFTER`: seconds before an unacknowledged
+  high-confidence alert re-fires once (default 3600).
 
-`FABLE_MONITOR_NOTIFY` is an optional shell command run on high-signal alerts
-(relevant Federal Register documents and page changes). The alert text is passed
-as the positional parameter `$1`, so it is safe against shell injection. Example
-for macOS using terminal-notifier:
+`FABLE_MONITOR_NOTIFY` is an optional shell command run on high-confidence trips
+and escalations. The alert text is passed as the positional parameter `$1`, so
+it is safe against shell injection. Example for macOS using terminal-notifier:
 
     export FABLE_MONITOR_NOTIFY='terminal-notifier -title "fable-monitor" -message "$1"'
 
@@ -111,18 +172,29 @@ Resource usage.
 Every poll records what it found to the observation log (compressed JSONL), so
 over time you accumulate a history of new Federal Register documents and
 keyword-page changes. The quickest way to read it is the built-in formatted
-reader:
+reader. Use `view` for an at-a-glance dataview of recent activity, the last 90
+days, newest-first, or `log` for the full history oldest-first:
+
+    ./zig-out/bin/fable-monitor view                 # last 90 days, newest-first
+    ./zig-out/bin/fable-monitor view --relevant       # only high-signal events
+    ./zig-out/bin/fable-monitor view --days 30 --source fr_bis
+    ./zig-out/bin/fable-monitor view --since 2026-03-25 --limit 50
 
     ./zig-out/bin/fable-monitor log                 # aligned, colorized table
     ./zig-out/bin/fable-monitor log --event changed  # filter by event kind
     ./zig-out/bin/fable-monitor log --source fr_bis --limit 20
     ./zig-out/bin/fable-monitor log --plain          # tab-separated, for grep/awk
 
+Both readers share the same flags: `--source ID`, `--event KIND`, `--since DATE`,
+`--days N`, `--relevant`, `--desc`/`--asc`, `--limit N`, `--width COLS`,
+`--plain`, and `--color`/`--no-color`. `view` just defaults `--days 90 --desc`;
+`log` defaults to the whole log ascending. Flags override either preset.
+
 ```
 TIME              SOURCE        EVENT              REF         INFO
 ──────────────────────────────────────────────────────────────────────
 2026-06-18 14:03  fr_anthropic  relevant_document  2026-12345  Export controls on Fable 5…
-2026-06-18 15:30  bis_news      changed            —           https://www.bis.gov/news-updates
+2026-06-18 15:30  bis_news      changed           ,           https://www.bis.gov/news-updates
 ```
 
 You can also read the raw log directly by decompressing:
@@ -147,7 +219,7 @@ to the `zstd` binary. Schema, event kinds, and details are in
 
 ## Banner
 
-A bit of flourish for the tool's namesake — render `FABLE` (or any text) as a
+A bit of flourish for the tool's namesake, render `FABLE` (or any text) as a
 terminal banner drawn with the bundled blackletter TrueType font:
 
     ./zig-out/bin/fable-monitor banner            # FABLE at the default size
@@ -162,7 +234,7 @@ binary, so `banner` needs no network, files, `curl`, or `zstd`. Details are in
 ## Run it in the background (macOS launchd)
 
 The intended use: a scheduled agent that polls in the background and notifies you
-on a relevant change. An installer scripts the whole thing — it builds a release
+on a relevant change. An installer scripts the whole thing, it builds a release
 binary, stages it (and its state/log) under
 `~/Library/Application Support/fable-monitor/`, generates a LaunchAgent, and
 loads it:
@@ -174,7 +246,7 @@ loads it:
     just uninstall          # stop and remove
 
 (The binary is staged under Application Support, not run from this checkout,
-because macOS TCC-protects `~/Desktop`/`~/Documents`/`~/Downloads` — a background
+because macOS TCC-protects `~/Desktop`/`~/Documents`/`~/Downloads`, a background
 agent can't satisfy the consent prompt there and would hang at launch.)
 
 It polls every 30 minutes (and once immediately). Change the cadence with
@@ -182,35 +254,54 @@ It polls every 30 minutes (and once immediately). Change the cadence with
 
     FABLE_INTERVAL=600 just install      # every 10 minutes
 
-Notifications fire only on high-signal alerts (a `[RELEVANT]` Federal Register
-document or a watched-page change). The installer uses
+Notifications fire only on high-confidence trips and escalations. The installer uses
 [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) if present
-(more reliable from a background agent — `brew install terminal-notifier`),
+(more reliable from a background agent, `brew install terminal-notifier`),
 otherwise the built-in `osascript`; macOS may ask you to allow notifications the
 first time. To preview the generated agent without installing: `just
 install-preview`. The plist at `dist/io.zerocreativity.fable-monitor.plist` is a
 hand-editable reference; `just install` generates the real one for you.
 
+### Run it on Linux / Zo.computer (systemd or cron)
+
+`dist/install-linux.sh` installs a recurring job on Linux, parameterized by
+scheduler (auto-detect; `SCHEDULER=systemd|cron|zo`). It builds a ReleaseSafe
+binary, stages it and durable state under `FABLE_HOME` (default
+`~/.local/share/fable-monitor`; point it at a persistent volume on Zo), writes a
+`0600` env file sourcing secrets from the environment, runs `preflight`, and
+registers a systemd user timer or a crontab entry:
+
+    just install-linux            # or: bash dist/install-linux.sh
+    just install-linux-preview    # bash dist/install-linux.sh --dry-run
+    just uninstall-linux
+
+See [`docs/deployment.md`](docs/deployment.md) for the env-var reference and the
+dead-man's-switch heartbeat.
+
 ## Tuning
 
-The source list, keywords, and per-source keyword overrides live in
-`src/sources.zig`. The Federal Register queries can be tightened or broadened by
-editing their query strings (the API supports filtering by agency, date,
-document type, and full-text term).
+The source list is a JSON config: the embedded default lives in
+`src/sources_default.json`, and `FABLE_MONITOR_SOURCES` points at an external
+file to override it without rebuilding. Each source carries an `id`, `kind`,
+`tier`, `url`, `match` set, and cadence; toggle sources at runtime with
+`FABLE_MONITOR_ONLY` / `FABLE_MONITOR_DISABLE`. The Federal Register queries are
+just URL query strings (filterable by agency, date, document type, and full-text
+term). Keyword and restoration vocabularies live in `src/sources.zig`. See
+[`docs/sources.md`](docs/sources.md).
 
 ## Documentation
 
 This README is the quick-start. Deeper technical documentation lives in
 [`docs/`](docs/):
 
-- [`docs/architecture.md`](docs/architecture.md) — components, data flow, and the run lifecycle.
-- [`docs/design-decisions.md`](docs/design-decisions.md) — why the tool is built the way it is (curl, single JSON state, fingerprinting, …).
-- [`docs/sources.md`](docs/sources.md) — the watched sources and how to add or tune one.
-- [`docs/state-format.md`](docs/state-format.md) — the state file schema and lifecycle.
-- [`docs/data-export.md`](docs/data-export.md) — the observation log and the `export` subcommand (NDJSON → Parquet).
-- [`docs/banner.md`](docs/banner.md) — the `banner` subcommand (renders text with the bundled TrueType font).
-- [`docs/deployment.md`](docs/deployment.md) — running under launchd/cron, env vars, and the notify hook.
-- [`docs/development.md`](docs/development.md) — building, testing, and the documentation-maintenance policy.
+- [`docs/architecture.md`](docs/architecture.md), components, data flow, and the run lifecycle.
+- [`docs/design-decisions.md`](docs/design-decisions.md), why the tool is built the way it is (curl, single JSON state, fingerprinting, …).
+- [`docs/sources.md`](docs/sources.md), the watched sources and how to add or tune one.
+- [`docs/state-format.md`](docs/state-format.md), the state file schema and lifecycle.
+- [`docs/data-export.md`](docs/data-export.md), the observation log and the `export` subcommand (NDJSON → Parquet).
+- [`docs/banner.md`](docs/banner.md), the `banner` subcommand (renders text with the bundled TrueType font).
+- [`docs/deployment.md`](docs/deployment.md), running under launchd/cron, env vars, and the notify hook.
+- [`docs/development.md`](docs/development.md), building, testing, and the documentation-maintenance policy.
 
 See [`docs/README.md`](docs/README.md) for the index and the policy that keeps
 these documents current.
