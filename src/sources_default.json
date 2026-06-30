@@ -30,7 +30,7 @@
       "tier": 1,
       "label": "Anthropic Fable/Mythos access statement",
       "url": "https://www.anthropic.com/news/fable-mythos-access",
-      "match": ["restored", "resumed", "reinstated", "reauthorized", "available", "lifted", "rescinded", "fable", "mythos"],
+      "match": ["restored", "resumed", "reinstated", "reauthorized", "available", "lifted", "rescinded", "return", "relaunch", "reintroduc", "now live", "fable", "mythos"],
       "poll": "fast",
       "lead_time": "decisive: restoration language on the dedicated statement page"
     },

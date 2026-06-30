@@ -15,10 +15,18 @@ pub const keywords = [_][]const u8{ "fable", "mythos", "anthropic" };
 /// statement page, indicate export-control access has been restored. The
 /// default `match` set for statement_watch sources is these plus the model
 /// names, so the fingerprint shifts when restoration language appears.
+///
+/// All entries are substrings matched against lowercased, tag-stripped text
+/// (see `html.normalizeHtml`), so a stem covers its inflections: "return"
+/// catches "returns"/"returning"/"returned", "relaunch" catches "relaunched".
+/// Stems are kept long enough to avoid loose hits (e.g. "return", not "back",
+/// which would match "background"/"feedback").
 pub const restoration_terms = [_][]const u8{
     "restored",      "resumed",         "reinstated", "reauthorized",
     "available",     "lifted",          "rescinded",  "vacated",
-    "authorization", "general license",
+    "authorization", "general license", "return",     "relaunch",
+    "reintroduc",    "re-enabl",        "reenabl",    "now live",
+    "live again",    "back online",
 };
 
 /// The model identifiers whose presence in a public model listing is the
@@ -138,4 +146,28 @@ test "tier-1 sources are decisive" {
     const s2 = Source{ .id = "y", .kind = .federal_register, .tier = .tier2, .url = "", .label = "" };
     try testing.expect(s1.isDecisive());
     try testing.expect(!s2.isDecisive());
+}
+
+test "restoration vocabulary covers the 'returning' family without loose hits" {
+    // Mirrors poll.zig's escalation check: substring match against lowercased,
+    // tag-stripped text. Phrases the way a real announcement would word a return.
+    const hit = struct {
+        fn f(text: []const u8) bool {
+            for (restoration_terms) |t| if (std.mem.indexOf(u8, text, t) != null) return true;
+            return false;
+        }
+    }.f;
+
+    // Restoration phrasings that must escalate to high-confidence.
+    try testing.expect(hit("access to fable 5 is returning to the api"));
+    try testing.expect(hit("fable 5 returns effective today"));
+    try testing.expect(hit("we are relaunching fable and mythos"));
+    try testing.expect(hit("fable 5 reintroduced for all customers"));
+    try testing.expect(hit("fable 5 is now live again"));
+    try testing.expect(hit("fable 5 is back online"));
+    try testing.expect(hit("export access re-enabled for fable 5"));
+
+    // Common substrings that must NOT trip the new stems (regression guard).
+    try testing.expect(!hit("background information on export policy"));
+    try testing.expect(!hit("we appreciate your feedback on the rollback"));
 }
