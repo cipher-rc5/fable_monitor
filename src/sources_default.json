@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "fast_interval_s": 45,
+  "slow_interval_s": 1800,
+  "concurrency": 1,
+  "sources": [
+    {
+      "id": "anthropic_model_list",
+      "kind": "model_list_probe",
+      "tier": 1,
+      "label": "Anthropic public model listing",
+      "url": "https://docs.anthropic.com/en/docs/about-claude/models/overview",
+      "match": ["claude-fable-5", "claude-mythos-5"],
+      "poll": "fast",
+      "lead_time": "decisive: absent-to-present is live-access confirmation, not a precursor"
+    },
+    {
+      "id": "anthropic_pricing",
+      "kind": "model_list_probe",
+      "tier": 1,
+      "label": "Anthropic public pricing listing",
+      "url": "https://www.anthropic.com/pricing",
+      "match": ["claude-fable-5", "claude-mythos-5"],
+      "poll": "fast",
+      "lead_time": "decisive: independent corroborator of the model listing"
+    },
+    {
+      "id": "anthropic_statement",
+      "kind": "statement_watch",
+      "tier": 1,
+      "label": "Anthropic Fable/Mythos access statement",
+      "url": "https://www.anthropic.com/news/fable-mythos-access",
+      "match": ["restored", "resumed", "reinstated", "reauthorized", "available", "lifted", "rescinded", "return", "relaunch", "reintroduc", "now live", "fable", "mythos"],
+      "poll": "fast",
+      "lead_time": "decisive: restoration language on the dedicated statement page"
+    },
+    {
+      "id": "fr_pi_bis",
+      "kind": "federal_register_public_inspection",
+      "tier": 2,
+      "label": "Federal Register public inspection (Bureau of Industry and Security)",
+      "url": "https://www.federalregister.gov/api/v1/public-inspection-documents.json?conditions%5Bagencies%5D%5B%5D=industry-and-security-bureau&per_page=20",
+      "lead_time": "hours-to-days ahead of official FR publication"
+    },
+    {
+      "id": "fr_pi_anthropic",
+      "kind": "federal_register_public_inspection",
+      "tier": 2,
+      "label": "Federal Register public inspection (term: Anthropic)",
+      "url": "https://www.federalregister.gov/api/v1/public-inspection-documents.json?conditions%5Bterm%5D=Anthropic&per_page=20",
+      "lead_time": "hours-to-days ahead of official FR publication"
+    },
+    {
+      "id": "fr_anthropic",
+      "kind": "federal_register",
+      "tier": 2,
+      "label": "Federal Register (term: Anthropic)",
+      "url": "https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest&conditions%5Bterm%5D=Anthropic",
+      "lead_time": "day-of official publication; relevance-filtered"
+    },
+    {
+      "id": "fr_bis",
+      "kind": "federal_register",
+      "tier": 2,
+      "label": "Federal Register (Bureau of Industry and Security rules)",
+      "url": "https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest&conditions%5Bagencies%5D%5B%5D=industry-and-security-bureau",
+      "lead_time": "day-of official publication; relevance-filtered"
+    },
+    {
+      "id": "bis_news",
+      "kind": "keyword_watch",
+      "tier": 2,
+      "label": "Bureau of Industry and Security news",
+      "url": "https://www.bis.gov/news-updates",
+      "lead_time": "day-of agency announcement"
+    },
+    {
+      "id": "anthropic_sitemap",
+      "kind": "feed_watch",
+      "tier": 3,
+      "label": "Anthropic newsroom sitemap",
+      "url": "https://www.anthropic.com/sitemap.xml",
+      "match": ["news", "fable", "mythos"],
+      "lead_time": "minutes ahead of the rendered index; advisory"
+    },
+    {
+      "id": "google_news",
+      "kind": "feed_watch",
+      "tier": 3,
+      "label": "Google News (Anthropic export control)",
+      "url": "https://news.google.com/rss/search?q=Anthropic%20export%20control%20Fable%20Mythos&hl=en-US&gl=US&ceid=US:en",
+      "match": ["anthropic", "fable", "mythos", "export"],
+      "lead_time": "advisory only, never auto-actioned"
+    },
+    {
+      "id": "polymarket",
+      "kind": "market_watch",
+      "tier": 3,
+      "label": "Polymarket (Anthropic access restoration)",
+      "url": "https://clob.polymarket.com/prices-history?market=PLACEHOLDER&interval=1h",
+      "lead_time": "advisory: market movement before our own trip flags a coverage gap"
+    }
+  ]
+}

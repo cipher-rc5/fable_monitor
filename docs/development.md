@@ -8,12 +8,12 @@ keeps this documentation current.
 ## Requirements
 
 - **Zig 0.16.0 or newer** (pinned via `minimum_zig_version` in `build.zig.zon`).
-- **`curl`** on `PATH` — only needed to *run* a live poll, not to build or test.
-- **`zstd`** on `PATH` — needed to *run* either mode (the tool compresses its
+- **`curl`** on `PATH`, only needed to *run* a live poll, not to build or test.
+- **`zstd`** on `PATH`, needed to *run* either mode (the tool compresses its
   state, log, and Parquet outputs with it); not needed to build or test.
   `brew install zstd` on macOS if missing.
-- **`just`** (optional) — task runner; `brew install just`.
-- **`duckdb`** (optional) — handy for verifying Parquet output end-to-end.
+- **`just`** (optional), task runner; `brew install just`.
+- **`duckdb`** (optional), handy for verifying Parquet output end-to-end.
 
 ## Project layout
 
@@ -37,7 +37,7 @@ src/parquet.zig      # minimal std-only Parquet writer (used by `export`)
 src/banner.zig       # from-scratch TrueType rasterizer (the `banner` subcommand)
 src/assets/          # bundled font (ManufacturingConsent-Regular.ttf) + OFL.txt
 dist/                # launchd plist template + install/uninstall scripts
-scripts/             # standalone tooling (analyze.py — resource analysis)
+scripts/             # standalone tooling (analyze.py, resource analysis)
 docs/                # this documentation set
 .github/workflows/   # CI
 ```
@@ -49,7 +49,7 @@ docs/                # this documentation set
 | install | `zig build` | Compile and install `zig-out/bin/fable-monitor`. |
 | run | `zig build run` | Build, then run one poll. Forwards extra args. |
 | test | `zig build test` | Compile and run the unit tests. `src/main.zig` is the test root and references every sibling module, so each module's own tests run. |
-| check | `zig build check` | Type-check only, no binary — fast feedback / LSP. |
+| check | `zig build check` | Type-check only, no binary, fast feedback / LSP. |
 
 The exe, test, and check targets all share one `root_module`, so they stay in
 sync automatically.
@@ -63,7 +63,7 @@ Parquet encoder's primitives (zigzag varints, compact field headers, the file
 envelope). `src/main.zig` is the test root: its `test {}` block references every
 module (`_ = parquet;`, `_ = @import("html.zig");`, …) so all of those tests run
 under `zig build test`. They need no network. The I/O paths (curl, state file,
-notify) are exercised end-to-end by running the binary — see `just demo`,
+notify) are exercised end-to-end by running the binary, see `just demo`,
 `just test-notify`, and `just test-no-deps`.
 
 Parquet **format** correctness can't be checked by std-only Zig (it can't parse
@@ -85,7 +85,7 @@ The most useful:
 
 | Recipe | Purpose |
 |---|---|
-| `just ci` | `fmt-check` + `test` + `build` — the full pre-push gate. |
+| `just ci` | `fmt-check` + `test` + `build`, the full pre-push gate. |
 | `just demo` | Baseline run + no-change run against a temp state file. |
 | `just run` | One real poll against a throwaway state file. |
 | `just export` | Write Parquet tables (`events`, `state_seen`, `state_keyword_hashes`) to `./parquet`. |
@@ -118,7 +118,7 @@ module (`@import("build_options")` in `src/main.zig`; see the Releasing section)
 That module only exists once `build.zig` runs, so a language server that
 analyzes the source statically reports *"no module named 'build_options'"*. The
 committed [`zls.json`](../zls.json) fixes this by enabling build-on-save against
-the `check` step, which makes ZLS evaluate `build.zig` and pick up the module —
+the `check` step, which makes ZLS evaluate `build.zig` and pick up the module , 
 reload your editor/ZLS after first checkout for it to take effect. `zig build`
 and `zig build test` are unaffected either way.
 
@@ -126,7 +126,7 @@ and `zig build test` are unaffected either way.
 
 The tool is one-shot: each invocation is a fresh, short-lived process that
 allocates from a single arena and frees everything on exit (decision 8), so
-there is **no cross-run growth to chase** — what matters is per-invocation peak
+there is **no cross-run growth to chase**, what matters is per-invocation peak
 memory and CPU, plus on-disk growth of the log.
 
 Measure it with:
@@ -142,17 +142,20 @@ child processes that `time -l` on the parent misses. Representative numbers
 
 | Subcommand | Process peak RSS | Children (curl/zstd) | CPU | Wall |
 |---|---|---|---|---|
-| `banner` | ~2–4 MB | — | ~0.003s | instant |
+| `banner` | ~2–4 MB |, | ~0.003s | instant |
 | `log` | ~2–4 MB | ~2 MB | ~0.005s | 0.01s |
 | `export` | ~2–4 MB | ~2 MB | ~0.06s | 0.08s |
 | `poll` | **~16–18 MB** | ~7.6 MB | ~0.2s | network-bound |
 
 For repeated, aggregated measurements (min/median/mean/max/stdev over N samples,
 plus CSV export for your own analysis), use the standalone
-[`scripts/analyze.py`](../scripts/analyze.py) — `just analyze`, or run it
-directly: `scripts/analyze.py --samples 15 --csv samples.csv`. It is pure
-stdlib, works on macOS and Linux, and sources its figures from the same
-`FABLE_MONITOR_STATS` self-report (so it captures the child processes too).
+[`scripts/analyze.py`](../scripts/analyze.py), `just analyze`, or run it
+directly: `uv run scripts/analyze.py --samples 15 --csv samples.csv`. It is run
+strictly through [uv](https://docs.astral.sh/uv/), which provisions the pinned
+Python (`requires-python = ">=3.14"`, declared in the script's PEP 723 inline
+metadata), no manual interpreter or virtualenv setup. It is pure stdlib, works
+on macOS and Linux, and sources its figures from the same `FABLE_MONITOR_STATS`
+self-report (so it captures the child processes too).
 
 The `poll` figure dominates because the arena holds every fetched body for the
 whole run (it never frees mid-run), so peak ≈ the sum of the fetched pages,
@@ -164,13 +167,13 @@ then exits, so the scheduled agent's steady-state footprint is ~0.
 Set `FABLE_MONITOR_STATS=1` and the program logs a one-line `getrusage` summary
 (process + children peak RSS and CPU) to stderr at the end of any run. Enabling
 it in the launchd agent (the plist's `EnvironmentVariables`) records each poll's
-footprint into the agent's `err.log` — handy for spotting a page that has grown
+footprint into the agent's `err.log`, handy for spotting a page that has grown
 pathologically large. The probe is `getrusage(2)`, so it costs nothing.
 
 ### Disk
 
 State is capped (200 document numbers) so it stays tiny. The observation log
-grows with *events* (not poll frequency) — a baseline is ~2–3 KB compressed and
+grows with *events* (not poll frequency), a baseline is ~2–3 KB compressed and
 it only grows when something actually changes; rotate it if it ever matters
 (see [data-export.md](data-export.md) / [design-decisions.md](design-decisions.md)
 decision 9).
@@ -181,7 +184,7 @@ Documentation is treated as part of the change, not a follow-up. The full policy
 and the **code → doc map** live in [docs/README.md](README.md). In short:
 
 1. A PR that changes behavior updates the affected doc(s) in the **same** PR.
-2. Each doc carries a `Last reviewed:` stamp — update it when you touch the doc,
+2. Each doc carries a `Last reviewed:` stamp, update it when you touch the doc,
    and refresh every stamp at release time after a skim.
 3. New subsystem → new row in the code→doc map + a stamped doc.
 
@@ -191,7 +194,7 @@ here and in [docs/README.md](README.md).
 
 ## Releasing
 
-1. Bump `version` in `build.zig.zon` only — it is the single source of truth.
+1. Bump `version` in `build.zig.zon` only, it is the single source of truth.
    `build.zig` generates a `build_options` module from `build.zig.zon`'s
    `version`, and the binary reads it via `@import("build_options").version`, so
    there is no second constant to keep in sync.

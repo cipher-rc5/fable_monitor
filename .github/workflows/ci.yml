@@ -16,11 +16,17 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Install runtime dependencies (curl, zstd)
+        run: sudo apt-get update && sudo apt-get install -y zstd curl
+
       - name: Run tests
         run: zig build test --summary all
 
       - name: Build
         run: zig build
+
+      - name: End-to-end fixture replay
+        run: bash tests/e2e.sh
 
       - name: Check formatting
         run: zig fmt --check src/ build.zig

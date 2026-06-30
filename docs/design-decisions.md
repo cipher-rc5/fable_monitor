@@ -40,7 +40,7 @@ everything *except* the fetch.
 per request. We mitigate the failure mode with a `toolAvailable()` preflight
 (the shared `<name> --version` check, also used for `zstd`) that gives a clear
 error instead of opaque per-source spawn failures. If Zig's
-HTTP client stabilizes, this is the most likely decision to revisit — see the
+HTTP client stabilizes, this is the most likely decision to revisit, see the
 code→doc map in [README.md](README.md).
 
 ---
@@ -49,19 +49,19 @@ code→doc map in [README.md](README.md).
 
 **Decision.** Cross-run continuity is a single file on disk, read at start and
 rewritten at end. No database. It is line-delimited JSON (one tagged record per
-line — `kind:"seen"` / `kind:"hash"`), zstd-compressed.
+line, `kind:"seen"` / `kind:"hash"`), zstd-compressed.
 
 **Why.** The state is tiny (a list of seen document numbers and a handful of
 hashes), so a database would be vastly disproportionate. It was originally a
 single pretty-printed JSON object; it is now JSONL so the whole codebase shares
 one on-disk convention (the observation log is JSONL too), and zstd-compressed
 for consistency with the other outputs (decision 11). The records are still
-`std.json`-serialized and trivially inspectable — `zstd -dc state.jsonl.zst`
+`std.json`-serialized and trivially inspectable, `zstd -dc state.jsonl.zst`
 pipes straight to `jq` (see [state-format.md](state-format.md)).
 
 **Trade-off.** No concurrent-writer safety and a full rewrite each run (both
 non-issues under one-run-one-poll: one writer, small file). Compression means
-the file is no longer editable in place — to hand-edit it for testing you
+the file is no longer editable in place, to hand-edit it for testing you
 decompress, edit, and recompress (documented in [state-format.md](state-format.md)),
 and the tool now depends on the `zstd` binary even to read its own state.
 
@@ -72,14 +72,14 @@ and the tool now depends on the `zstd` binary even to read its own state.
 **Decision.** Sources are split into `federal_register` (structured JSON API)
 and `keyword_watch` (arbitrary HTML), handled by separate code paths.
 
-**Why.** The Federal Register API gives stable, document-numbered records — a
+**Why.** The Federal Register API gives stable, document-numbered records, a
 high-reliability signal we can diff exactly. Arbitrary pages (the Anthropic
 newsroom, BIS news) have no such structure, so they need a fuzzier approach.
 Modeling the two explicitly keeps each path honest about its reliability: the
 README tells the reader to weight the structured feed highest.
 
-**Trade-off.** Two code paths to maintain. The alternative — forcing everything
-through one mechanism — would either lose the precision of the structured feed
+**Trade-off.** Two code paths to maintain. The alternative, forcing everything
+through one mechanism, would either lose the precision of the structured feed
 or fail entirely on unstructured pages.
 
 ---
@@ -87,7 +87,7 @@ or fail entirely on unstructured pages.
 ## 5. Fingerprint keyword context, don't hash raw HTML
 
 **Decision.** For keyword-watch sources, hash a normalized, keyword-windowed,
-sorted, de-duplicated projection of the page — not the raw bytes.
+sorted, de-duplicated projection of the page, not the raw bytes.
 
 **Why.** Raw HTML is noisy: minified markup, rotating CSRF/session tokens,
 reordered blocks, and ads would all flip a naive hash and bury the real signal
@@ -96,7 +96,7 @@ fingerprint change when the *substance* near a watched term changes, and stay
 put otherwise. Sorting + de-duping the windows makes it robust to block
 reordering.
 
-**Trade-off.** We detect *that* something changed, not *what* — the alert points
+**Trade-off.** We detect *that* something changed, not *what*, the alert points
 a human at the page to look. We also accept that a determined redesign of a page
 can still cause a one-time false positive. Both are acceptable for a
 human-in-the-loop monitor. The ±100-byte window radius is a tunable in
@@ -164,8 +164,8 @@ poll grouped. See [data-export.md](data-export.md).
 **Trade-off.** Because the log is a single zstd stream, "append" is really a
 read-modify-write: each run decompresses the existing log, adds its lines, and
 recompresses. That is more work than the original open-and-append-at-the-end
-approach, but the log grows with *events*, not poll frequency — a slow-moving
-regulatory signal produces few rows — so the rewrite stays cheap. The log has no
+approach, but the log grows with *events*, not poll frequency, a slow-moving
+regulatory signal produces few rows, so the rewrite stays cheap. The log has no
 automatic cap; rotation is left to the operator. We log events, not every poll,
 so the file is not an uptime record.
 
@@ -181,7 +181,7 @@ takes an optional `Compressor` callback and, when given one, compresses each
 page and tags the chunk with the ZSTD codec. The monitor always passes a
 zstd-backed compressor (decision 11).
 
-**Why.** This keeps the project std-only — the curl decision (decision 2)
+**Why.** This keeps the project std-only, the curl decision (decision 2)
 already establishes that we add a dependency only when the alternative is worse.
 A C/Arrow dependency would dwarf the program and reintroduce the build/ABI churn
 we avoid; requiring DuckDB at runtime would push a heavy tool onto every
@@ -191,7 +191,7 @@ while still producing standards-compliant ZSTD-coded Parquet that DuckDB,
 pandas/pyarrow, and Polars read natively.
 
 **Trade-off.** We own a (small) chunk of the Parquet spec, and still omit
-dictionary encoding and column statistics — irrelevant at this scale. Each page
+dictionary encoding and column statistics, irrelevant at this scale. Each page
 is compressed by spawning `zstd` once, so an export does a handful of spawns;
 fine for an occasional, manual operation. Because std-only Zig can't parse
 Parquet back, the encoder is validated by unit tests on its primitives plus an
@@ -201,14 +201,14 @@ end-to-end read with a real reader; see [data-export.md](data-export.md).
 
 ## 11. Compression is delegated to the system `zstd` binary
 
-**Decision.** All zstandard compression — the state file, the observation log,
-and Parquet pages — runs through the system `zstd` binary via `std.process.run`,
+**Decision.** All zstandard compression, the state file, the observation log,
+and Parquet pages, runs through the system `zstd` binary via `std.process.run`,
 the same delegation pattern as curl (decision 2). The preflight (`toolAvailable`)
 requires `zstd` in both poll and export modes.
 
 **Why.** Zig 0.16's standard library ships a zstd *decompressor* but no
 compressor, so in-process zstd is not available std-only. The alternatives were
-linking libzstd (a C dependency — the very build/ABI churn the curl decision
+linking libzstd (a C dependency, the very build/ABI churn the curl decision
 avoids) or substituting gzip (which std *can* compress, but the request was
 specifically zstandard). Delegating keeps the program std-only and gets a
 battle-tested, well-tuned encoder for free. We delegate *decompression* to the
@@ -216,14 +216,14 @@ binary too, rather than mixing in std's decoder, so there is a single code path
 and no second set of edge cases (window sizes, multi-frame streams).
 
 **Implementation note.** `std.process.run` cannot feed a child's stdin, so input
-is staged in a temp file that `zstd` reads while we drain its stdout — this also
+is staged in a temp file that `zstd` reads while we drain its stdout, this also
 sidesteps any pipe-buffer deadlock. Runs are single-threaded (one poll at a
 time), so a fixed temp filename is safe; it is removed after each call.
 
 **Trade-off.** A second runtime dependency, and `zstd` is less universally
 preinstalled than `curl` (notably it is not guaranteed on older macOS), so the
 preflight and docs call it out as a prerequisite. Compression/decompression cost
-a process spawn plus a temp-file write each — negligible at this tool's volume
+a process spawn plus a temp-file write each, negligible at this tool's volume
 and cadence. If Zig's std gains a zstd compressor, this is the decision to
 revisit (it would also let the state file be read without the binary present).
 
@@ -233,7 +233,7 @@ revisit (it would also let the state file be read without the binary present).
 
 **Decision.** The `banner` subcommand (`src/banner.zig`) renders text with a
 real TrueType font by parsing the sfnt tables and rasterizing the glyph outlines
-from scratch — no font/graphics library. The font (*Manufacturing Consent*, SIL
+from scratch, no font/graphics library. The font (*Manufacturing Consent*, SIL
 OFL) is `@embedFile`d from `src/assets/` into the binary.
 
 **Why.** It is the same calculus as the Parquet writer (decision 10): a font
@@ -246,8 +246,8 @@ work anywhere with zero external files; the OFL explicitly permits bundling, so
 `src/assets/OFL.txt` ships alongside it. `@embedFile` cannot reference paths
 outside the module directory, which is why the asset lives under `src/`.
 
-**Trade-off.** It is not a general font engine — no hinting, kerning, composite
-glyphs, antialiasing, or right-to-left — and at small sizes a blackletter face
+**Trade-off.** It is not a general font engine, no hinting, kerning, composite
+glyphs, antialiasing, or right-to-left, and at small sizes a blackletter face
 is inherently busy. That is fine for a one-word vanity banner. The binary
 carries a ~60 KB font, and the repo carries the font plus its license (a
 deliberate, OFL-compliant choice; see decision and the

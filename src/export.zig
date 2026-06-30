@@ -53,6 +53,14 @@ fn exportEvents(ctx: *Context, out_dir: []const u8) !void {
         .{ .name = "publication_date", .type = .str },
         .{ .name = "url", .type = .str },
         .{ .name = "detail", .type = .str },
+        // v2 columns (default to empty/0 for rows written by older builds).
+        .{ .name = "tier", .type = .int },
+        .{ .name = "confidence", .type = .str },
+        .{ .name = "event_identity", .type = .str },
+        .{ .name = "published_at", .type = .str },
+        .{ .name = "published_epoch_ms", .type = .int },
+        .{ .name = "fetch_ms", .type = .int },
+        .{ .name = "http_status", .type = .int },
     };
 
     var rows: std.ArrayList([]const parquet.Value) = .empty;
@@ -77,6 +85,13 @@ fn exportEvents(ctx: *Context, out_dir: []const u8) !void {
             .{ .str = e.publication_date },
             .{ .str = e.url },
             .{ .str = e.detail },
+            .{ .int = e.tier },
+            .{ .str = e.confidence },
+            .{ .str = e.event_identity },
+            .{ .str = e.published_at },
+            .{ .int = e.published_epoch_ms },
+            .{ .int = e.fetch_ms },
+            .{ .int = e.http_status },
         }));
     }
 

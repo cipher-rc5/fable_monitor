@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
 """Analyze fable-monitor's memory and resource consumption.
 
 Runs each subcommand several times and reports peak RSS and CPU/wall time,
@@ -7,17 +11,17 @@ binary's own FABLE_MONITOR_STATS self-report (getrusage), so the numbers are
 accurate, OS-normalized, and — unlike `/usr/bin/time` on the parent — include
 the curl/zstd child processes. Wall time is measured by this script.
 
-Pure standard library; works on macOS and Linux.
+Pure standard library; works on macOS and Linux. Run it with uv, which
+provisions the pinned Python (>=3.14) from the inline script metadata above:
 
-Examples:
-    scripts/analyze.py                          # build + analyze, 5 samples each
-    scripts/analyze.py --samples 15             # more samples for tighter stats
-    scripts/analyze.py --subcommands poll,banner
-    scripts/analyze.py --csv samples.csv        # also dump raw per-sample rows
-    scripts/analyze.py --bin /path/to/fable-monitor --no-build
+    uv run scripts/analyze.py                          # build + analyze, 5 samples each
+    uv run scripts/analyze.py --samples 15             # more samples for tighter stats
+    uv run scripts/analyze.py --subcommands poll,banner
+    uv run scripts/analyze.py --csv samples.csv        # also dump raw per-sample rows
+    uv run scripts/analyze.py --bin /path/to/fable-monitor --no-build
+
+The shebang is `uv run --script`, so `scripts/analyze.py …` also works directly.
 """
-
-from __future__ import annotations
 
 import argparse
 import csv as csvmod
