@@ -35,7 +35,7 @@ const version = @import("build_options").version;
 
 const usage =
     "Usage: fable-monitor [poll | preflight | audit | ack <event_id> | " ++
-    "view [filters] | log [filters] | export [out_dir] | banner [text] [height]]";
+    "view [filters] | log [filters] | export [out_dir] | serve [port] | banner [text] [height]]";
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -115,6 +115,19 @@ pub fn main(init: std.process.Init) !void {
             }
             return poll.acknowledge(&ctx, argv[2]);
         }
+        if (std.mem.eql(u8, cmd, "serve")) {
+            const serve = @import("serve.zig");
+            const port: u16 = blk: {
+                if (argv.len > 2) break :blk std.fmt.parseInt(u16, argv[2], 10) catch serve.default_port;
+                if (env.get("FABLE_MONITOR_PORT")) |p| break :blk std.fmt.parseInt(u16, p, 10) catch serve.default_port;
+                break :blk serve.default_port;
+            };
+            return serve.run(&ctx, .{
+                .sources_path = opts.sources_path,
+                .only_csv = opts.only_csv,
+                .disable_csv = opts.disable_csv,
+            }, port);
+        }
         if (std.mem.eql(u8, cmd, "preflight")) {
             // curl is required for egress checks.
             if (!fetch.toolAvailable(&ctx, "curl")) {
@@ -183,4 +196,5 @@ test {
     _ = @import("poll.zig");
     _ = @import("export.zig");
     _ = @import("context.zig");
+    _ = @import("serve.zig");
 }

@@ -65,6 +65,13 @@ log *args:
 view *args:
     FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" zig build run -- view {{args}}
 
+# Serve the read-only htmx + Tailwind v4 dashboard over the installed agent's
+# data on http://127.0.0.1:8787 (override the port: `just ui 9000`).
+ui port="8787":
+    FABLE_MONITOR_STATE=~/"Library/Application Support/fable-monitor/state.jsonl.zst" \
+    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" \
+    zig build run -- serve {{port}}
+
 # Inspect a compressed JSONL file (state or log): decompress and pretty-print.
 # Usage: just inspect /path/to/file.jsonl.zst   (pipe through jq if installed)
 inspect file:
