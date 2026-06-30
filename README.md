@@ -97,6 +97,7 @@ The mode is selected by the first argument (default `poll`):
 | `ack <event_id>` | Acknowledge a fired alert so it stops escalating. |
 | `view` / `log` | Read the observation log as a formatted table (see below). |
 | `export [out_dir]` | Project the log + state into Parquet tables. |
+| `serve [port]` | Serve the read-only web dashboard (htmx + Tailwind v4) over the log + state. See [Web UI](#web-ui). |
 | `banner [text] [height]` | Render text as a TrueType terminal banner. |
 
 ## Quickstart
@@ -217,6 +218,49 @@ The Parquet writer is implemented in std-only Zig; page compression is delegated
 to the `zstd` binary. Schema, event kinds, and details are in
 [`docs/data-export.md`](docs/data-export.md).
 
+## Web UI
+
+A read-only browser dashboard over the same log and state the CLI reads — the
+poll status, configured sources, recent events, and any active alerts, with the
+tier-1 restoration signal front and centre. It is built with **htmx** and
+**Tailwind CSS v4**, both loaded from a CDN, so there is no front-end build step
+or `node_modules`; the Zig binary is the whole backend.
+
+Start it:
+
+    just ui                                  # serves the installed agent's data on :8787
+    just ui 9000                             # choose a port
+
+    # or directly, pointing at whichever log/state you want to view:
+    ./zig-out/bin/fable-monitor serve        # default port 8787
+    ./zig-out/bin/fable-monitor serve 9000   # positional port
+    FABLE_MONITOR_PORT=9000 ./zig-out/bin/fable-monitor serve
+
+Then open **http://127.0.0.1:8787** (or your chosen port) in a browser.
+
+How it connects: the server binds **127.0.0.1 only** and serves the page shell at
+`/`. The browser-side htmx then polls small HTML fragment endpoints and swaps
+them into the page on an interval — no manual refresh:
+
+| Endpoint | Refresh | Shows |
+|---|---|---|
+| `GET /` | — | The page shell (loads htmx + Tailwind v4 from CDN, so the machine viewing the UI needs internet for those two assets). |
+| `GET /ui/status` | 5s | Stat cards: source count, events logged, active alerts, last observed time. |
+| `GET /ui/alerts` | 5s | Active (unacknowledged) alerts with tier, kind, and first-alerted time. |
+| `GET /ui/sources` | 30s | Every configured source with its tier, kind, poll class, and last success / change. |
+| `GET /ui/events?limit=N` | 10s | The most recent `N` events (default 30), newest first. |
+| `GET /healthz` | — | Plaintext `ok` for liveness checks. |
+
+Which data it reads is controlled by the same `FABLE_MONITOR_LOG` and
+`FABLE_MONITOR_STATE` paths as every other command (see [Environment
+variables](#environment-variables)); `just ui` points them at the installed
+agent under `~/Library/Application Support/fable-monitor/`. The server is
+**read-only** — it never writes the log or state — so it is safe to leave running
+alongside the scheduled poller that owns those files. It renders each request
+from a fresh arena and escapes all dynamic text. Because it binds loopback only,
+expose it beyond your machine with an SSH tunnel or a reverse proxy you control
+rather than changing the bind address.
+
 ## Banner
 
 A bit of flourish for the tool's namesake, render `FABLE` (or any text) as a
@@ -299,6 +343,7 @@ This README is the quick-start. Deeper technical documentation lives in
 - [`docs/sources.md`](docs/sources.md), the watched sources and how to add or tune one.
 - [`docs/state-format.md`](docs/state-format.md), the state file schema and lifecycle.
 - [`docs/data-export.md`](docs/data-export.md), the observation log and the `export` subcommand (NDJSON → Parquet).
+- [`docs/ui.md`](docs/ui.md), the `serve` subcommand: the read-only htmx + Tailwind v4 web dashboard and how the frontend connects.
 - [`docs/banner.md`](docs/banner.md), the `banner` subcommand (renders text with the bundled TrueType font).
 - [`docs/deployment.md`](docs/deployment.md), running under launchd/cron, env vars, and the notify hook.
 - [`docs/development.md`](docs/development.md), building, testing, and the documentation-maintenance policy.

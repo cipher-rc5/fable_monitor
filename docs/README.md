@@ -13,6 +13,7 @@ go deeper into how the tool works and *why* it is built the way it is.
 | [sources.md](sources.md) | The tier model, the JSON source config, source kinds, and toggles. |
 | [state-format.md](state-format.md) | The JSON state file: v2 schema, lifecycle, capping. |
 | [data-export.md](data-export.md) | The observation log and the `export` subcommand (NDJSON → Parquet). |
+| [ui.md](ui.md) | The `serve` subcommand: the read-only htmx + Tailwind v4 web dashboard and how the frontend connects. |
 | [banner.md](banner.md) | The `banner` subcommand (renders text with the bundled TrueType font). |
 | [deployment.md](deployment.md) | Running under launchd/cron, env vars, the notify hook. |
 | [development.md](development.md) | Build, test, the justfile, and the doc-maintenance policy. |
@@ -45,6 +46,7 @@ current, we follow three rules:
 | The `State` struct, `StateRecord`, `capTail`, or `loadState`/`saveState` in `src/state.zig` | [state-format.md](state-format.md) |
 | `src/parquet.zig`, the `Event` struct (`src/events.zig`), `events.appendLog`, `src/export.zig` (`exportParquet`), `src/view.zig` (the `log` reader), or the `export`/`log` subcommands | [data-export.md](data-export.md) |
 | The poll pipeline / detectors / trip logic in `src/poll.zig`, `fetch.*` (`src/fetch.zig`), `feed.parse` (`src/feed.zig`), the `zstd.*` helpers (`src/zstd.zig`), `extractKeywordContext`/`normalizeHtml` (`src/html.zig`), or arg dispatch in `src/main.zig` | [architecture.md](architecture.md) |
+| `src/serve.zig`, the `serve` subcommand, the `/ui/*` fragment endpoints, or the htmx + Tailwind v4 page shell | [ui.md](ui.md) |
 | `src/banner.zig`, the `banner` subcommand, or the bundled font in `src/assets/` | [banner.md](banner.md) |
 | Why a dependency / approach was chosen (e.g. dropping curl, adding a real HTTP client) | [design-decisions.md](design-decisions.md) |
 | Env vars, the notify hook, the structured-event schema, the plist, `dist/install-linux.sh`, or scheduling | [deployment.md](deployment.md), and the README |
