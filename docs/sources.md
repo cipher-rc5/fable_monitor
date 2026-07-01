@@ -21,10 +21,13 @@ tier-1 path is optimized for latency, the tier-2/3 paths for precision.
 | **tier2** | The official regulatory record. High precision but day-of (or hours-ahead) latency. Tripped as an advisory until corroborated. | Federal Register, Federal Register public inspection, BIS news |
 | **tier3** | Early but noisy, advance warning only. Advisory; never auto-actioned on its own. | newsroom sitemap, Google News, prediction markets |
 
-The default config ships **three independent tier-1 trippers**
-(`anthropic_model_list`, `anthropic_pricing`, `anthropic_statement`), so there is
-no single point of failure in the decisive signal path: any one of them seeing
-restoration is enough.
+The default config ships **four independent tier-1 trippers**
+(`anthropic_model_list`, `anthropic_pricing`, `anthropic_statement`, and the
+`anthropic_api_models` API probe), so there is no single point of failure in the
+decisive signal path: any one of them seeing restoration is enough. The API
+probe is the most authoritative (it confirms the model is actually callable) but
+requires `ANTHROPIC_API_KEY`; when that is unset it is skipped and the other
+three still cover the decisive path.
 
 ## The config file
 
@@ -86,6 +89,7 @@ default. The monitor always has sources to poll.
 | `kind` | Tier (typical) | What it does |
 |---|---|---|
 | `model_list_probe` | 1 | Reads the public model listing (metadata only, never a completion) and detects an **absent-to-present** transition of the controlled model identifiers (`claude-fable-5`, `claude-mythos-5`). The first observation of a source is a baseline and never trips. The transition is the single most decisive, highest-precision confirmation that access is live. |
+| `api_probe` | 1 | Same **absent-to-present** detection as `model_list_probe`, but against the authoritative Anthropic **`/v1/models`** API — the ground-truth "the model is actually callable" signal. Reuses the same detector (substring-scans the JSON body for the controlled ids). Requires an API key: it reads `ANTHROPIC_API_KEY` from the environment, sends it as the `x-api-key` header (with `anthropic-version: 2023-06-01`), and **skips gracefully with a single log line when the key is unset** (no fetch, no error), so the build, tests, and a keyless poller run fine. The key is only ever placed in a request header, never in a URL or any log line. |
 | `statement_watch` | 1 | Fingerprints the keyword context of the dedicated statement page. A change whose new context contains restoration vocabulary (`restored`, `resumed`, `reinstated`, `reauthorized`, `available`, `lifted`, `rescinded`, `vacated`, ...) is a high-confidence trip; any other change is advisory. |
 | `federal_register` | 2 | Polls the Federal Register documents JSON API; tracks new document numbers. A tightened relevance filter decides high-signal: the title or abstract must name Anthropic or a specific model (`fable 5`, `claude-fable-5`, ...), not merely contain the bare word "fable". |
 | `federal_register_public_inspection` | 2 | Same shape as `federal_register`, but against the public-inspection feed. These documents post *before* official publication, so they are an earlier signal. |

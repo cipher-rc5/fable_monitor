@@ -82,6 +82,11 @@ pub const SourceKind = enum {
     /// Public model listing: detect an absent-to-present transition of the
     /// controlled model identifiers. Reads listing metadata only.
     model_list_probe,
+    /// Anthropic `/v1/models` API: the ground-truth "callable" signal. Same
+    /// absent-to-present detection as `model_list_probe`, but against the
+    /// authoritative API listing. Requires `ANTHROPIC_API_KEY`; skipped when
+    /// unset. Reads listing metadata only, never a completion.
+    api_probe,
     /// RSS / Atom / sitemap: parse structure (guid/link/lastmod) instead of
     /// fingerprinting rendered HTML.
     feed_watch,
@@ -137,8 +142,10 @@ test "Tier round-trips through its integer form" {
 
 test "SourceKind parses from and renders to its tag name" {
     try testing.expectEqual(SourceKind.model_list_probe, SourceKind.fromString("model_list_probe").?);
+    try testing.expectEqual(SourceKind.api_probe, SourceKind.fromString("api_probe").?);
     try testing.expect(SourceKind.fromString("nope") == null);
     try testing.expectEqualStrings("statement_watch", SourceKind.statement_watch.logName());
+    try testing.expectEqualStrings("api_probe", SourceKind.api_probe.logName());
 }
 
 test "tier-1 sources are decisive" {

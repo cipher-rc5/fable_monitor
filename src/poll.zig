@@ -61,6 +61,10 @@ pub const Options = struct {
     /// Write per-source fetch metric rows to the observation log (off by default
     /// so the log grows with events, not poll frequency).
     log_metrics: bool = false,
+    /// Anthropic API key (ANTHROPIC_API_KEY) for `api_probe` sources. When null
+    /// or empty, api_probe sources are skipped (never fetched) so the monitor
+    /// runs fine without a key. Never logged; used only as a request header.
+    anthropic_api_key: ?[]const u8 = null,
 };
 
 /// Detection confidence. `high` trips immediately; `advisory` waits for
@@ -152,6 +156,13 @@ pub fn run(ctx: *Context, opts: Options) !void {
             carryForward(&r, src);
             continue;
         }
+        // api_probe needs a key: skip gracefully (no fetch, no error) when the
+        // key is unset so the build/tests and the keyless poller run fine.
+        if (src.kind == .api_probe and !hasApiKey(&r)) {
+            log("source '{s}': api_probe skipped (ANTHROPIC_API_KEY unset)", .{src.id});
+            carryForward(&r, src);
+            continue;
+        }
         pollOne(&r, src) catch |err| {
             // Fail closed: one source erroring must not abort the poll.
             log("error: source '{s}' failed: {s}", .{ src.id, @errorName(err) });
@@ -225,6 +236,12 @@ fn carryForward(r: *Run, src: Source) void {
     }
 }
 
+/// True when an Anthropic API key is configured (non-empty). Gates api_probe.
+fn hasApiKey(r: *Run) bool {
+    const key = r.opts.anthropic_api_key orelse return false;
+    return key.len > 0;
+}
+
 fn capFeeds(r: *Run, max: usize) []State.FeedSeen {
     if (r.feeds.items.len <= max) return r.feeds.items;
     return r.feeds.items[r.feeds.items.len - max ..];
@@ -267,7 +284,7 @@ fn pollOne(r: *Run, src: Source) !void {
     }
 
     switch (src.kind) {
-        .model_list_probe => try detectModelList(r, src, resp.body),
+        .model_list_probe, .api_probe => try detectModelList(r, src, resp.body),
         .statement_watch => try detectKeywordOrStatement(r, src, resp.body, true),
         .keyword_watch => try detectKeywordOrStatement(r, src, resp.body, false),
         .federal_register, .federal_register_public_inspection => try detectFederalRegister(r, src, resp.body),
@@ -305,7 +322,10 @@ fn fetchSource(r: *Run, src: Source) !FetchResult {
         return .{ .body = body };
     }
     const v = r.prev.validatorFor(src.id) orelse State.Validator{ .id = src.id };
-    const resp = try fetch.fetchConditional(r.ctx, src.url, v.etag, v.last_modified);
+    // Attach the API key only for api_probe; every other source fetches with the
+    // curl argv byte-for-byte unchanged.
+    const api_key: ?[]const u8 = if (src.kind == .api_probe) r.opts.anthropic_api_key else null;
+    const resp = try fetch.fetchConditional(r.ctx, src.url, v.etag, v.last_modified, api_key);
     return .{
         .status = resp.status,
         .body = resp.body,
@@ -959,11 +979,21 @@ pub fn preflight(ctx: *Context, opts: Options) !void {
     if (opts.heartbeat_url == null) log("preflight: FABLE_MONITOR_HEARTBEAT_URL unset (dead-man's switch disabled)", .{});
     if (ctx.notify_cmd != null) log("preflight: notify hook configured", .{}) else log("preflight: FABLE_MONITOR_NOTIFY unset (no push)", .{});
 
+    const has_api_key = if (opts.anthropic_api_key) |k| k.len > 0 else false;
+    if (!has_api_key) log("preflight: ANTHROPIC_API_KEY unset (api_probe sources are skipped)", .{});
+
     // Network egress per enabled source (HEAD-ish GET; failure is a warning, a
     // single source must not block startup, but report it loudly).
     for (cfg.sources) |src| {
         if (!src.enabled) continue;
-        const resp = fetch.fetchConditional(ctx, src.url, "", "") catch {
+        // Don't probe the API without a key: it would 401 and read as a false
+        // egress failure. Report it as skipped instead.
+        if (src.kind == .api_probe and !has_api_key) {
+            log("preflight: egress to '{s}' skipped (ANTHROPIC_API_KEY unset)", .{src.id});
+            continue;
+        }
+        const api_key: ?[]const u8 = if (src.kind == .api_probe) opts.anthropic_api_key else null;
+        const resp = fetch.fetchConditional(ctx, src.url, "", "", api_key) catch {
             log("preflight: egress to '{s}' FAILED ({s})", .{ src.id, src.url });
             continue;
         };
@@ -988,6 +1018,23 @@ test "extractMarketPrice finds a price field" {
 test "str coalesces a null FR field to empty" {
     try testing.expectEqualStrings("", str(null));
     try testing.expectEqualStrings("x", str("x"));
+}
+
+test "a /v1/models JSON body reveals a controlled model id (api_probe detection)" {
+    // Mirrors detectModelList's core: normalize the fetched body, then substring
+    // match the (lowercased) controlled ids. The api_probe kind reuses exactly
+    // this path against the Anthropic /v1/models JSON.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const present = "{\"data\":[{\"id\":\"claude-fable-5\",\"type\":\"model\"},{\"id\":\"claude-opus-4\",\"type\":\"model\"}]}";
+    const absent = "{\"data\":[{\"id\":\"claude-opus-4\",\"type\":\"model\"},{\"id\":\"claude-haiku-4\",\"type\":\"model\"}]}";
+
+    const t_present = try html.normalizeHtml(a, present);
+    const t_absent = try html.normalizeHtml(a, absent);
+    try testing.expect(std.mem.indexOf(u8, t_present, "claude-fable-5") != null);
+    try testing.expect(std.mem.indexOf(u8, t_absent, "claude-fable-5") == null);
 }
 
 test "effectiveConfidence promotes corroborated advisories" {
