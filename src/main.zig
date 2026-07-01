@@ -74,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
         .heartbeat_url = env.get("FABLE_MONITOR_HEARTBEAT_URL"),
         .escalate_after_s = envU32(env, "FABLE_MONITOR_ESCALATE_AFTER") orelse 3600,
         .log_metrics = stats_on or env.get("FABLE_MONITOR_METRICS") != null,
+        .anthropic_api_key = env.get("ANTHROPIC_API_KEY"),
     };
 
     const argv = try init.minimal.args.toSlice(arena);

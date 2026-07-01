@@ -25,6 +25,16 @@
       "lead_time": "decisive: independent corroborator of the model listing"
     },
     {
+      "id": "anthropic_api_models",
+      "kind": "api_probe",
+      "tier": 1,
+      "label": "Anthropic API model listing (/v1/models)",
+      "url": "https://api.anthropic.com/v1/models?limit=100",
+      "match": ["claude-fable-5", "claude-mythos-5"],
+      "poll": "fast",
+      "lead_time": "decisive: the model listed by the API is the ground-truth callable-access signal"
+    },
+    {
       "id": "anthropic_statement",
       "kind": "statement_watch",
       "tier": 1,

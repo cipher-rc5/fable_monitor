@@ -141,7 +141,7 @@ fn resolve(ctx: *Context, raw: RawConfig, origin: []const u8, opts: LoadOptions)
 fn defaultMatch(match: []const []const u8, kind: SourceKind) []const []const u8 {
     if (match.len > 0) return match;
     return switch (kind) {
-        .model_list_probe => &sources_mod.model_ids,
+        .model_list_probe, .api_probe => &sources_mod.model_ids,
         .statement_watch => &sources_mod.restoration_terms,
         else => &sources_mod.keywords,
     };
@@ -186,6 +186,7 @@ test "csvContains matches trimmed tokens" {
 
 test "defaultMatch picks a vocabulary by kind when empty" {
     try testing.expectEqual(@as(usize, sources_mod.model_ids.len), defaultMatch(&.{}, .model_list_probe).len);
+    try testing.expectEqual(@as(usize, sources_mod.model_ids.len), defaultMatch(&.{}, .api_probe).len);
     try testing.expectEqual(@as(usize, sources_mod.restoration_terms.len), defaultMatch(&.{}, .statement_watch).len);
     try testing.expectEqual(@as(usize, sources_mod.keywords.len), defaultMatch(&.{}, .federal_register).len);
     const custom = [_][]const u8{"x"};

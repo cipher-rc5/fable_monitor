@@ -39,16 +39,17 @@ pub fn fetchConditional(
     url: []const u8,
     etag: []const u8,
     last_modified: []const u8,
+    api_key: ?[]const u8,
 ) !Response {
     const start = Io.Timestamp.now(ctx.io, .real).toMilliseconds();
-    var resp = try curlOnce(ctx, url, etag, last_modified);
+    var resp = try curlOnce(ctx, url, etag, last_modified, api_key);
 
     // Honor 429 once, then give up for this poll (the next tick retries).
     if (resp.status == 429) {
         const wait_ms = @min(max_backoff_ms, parseRetryAfterMs(resp.body) orelse 1000);
         log("source fetch got 429 for {s}; backing off {d}ms then retrying once", .{ url, wait_ms });
         Io.sleep(ctx.io, Io.Duration.fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
-        resp = try curlOnce(ctx, url, etag, last_modified);
+        resp = try curlOnce(ctx, url, etag, last_modified, api_key);
     }
 
     resp.fetch_ms = Io.Timestamp.now(ctx.io, .real).toMilliseconds() - start;
@@ -60,8 +61,12 @@ pub fn fetchConditional(
 }
 
 /// One curl invocation. Body is captured on stdout; response headers are dumped
-/// to a per-url temp file and parsed for status, ETag, and Last-Modified.
-fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []const u8) !Response {
+/// to a per-url temp file and parsed for status, ETag, and Last-Modified. When
+/// `api_key` is non-empty, the Anthropic auth headers are added (used only by
+/// the `api_probe` source kind); the key value goes only into the `-H` arg and
+/// is never logged. All other callers pass null and get a byte-for-byte
+/// identical argv.
+fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []const u8, api_key: ?[]const u8) !Response {
     const hdr_path = try std.fmt.allocPrint(ctx.arena, ".fable-monitor.hdr.{x}.ztmp", .{std.hash.Wyhash.hash(0, url)});
     defer Io.Dir.cwd().deleteFile(ctx.io, hdr_path) catch {};
 
@@ -80,6 +85,16 @@ fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []c
     if (last_modified.len > 0) {
         try argv.append(a, "-H");
         try argv.append(a, try std.fmt.allocPrint(a, "If-Modified-Since: {s}", .{last_modified}));
+    }
+    // Anthropic API auth (api_probe only). The key is placed solely in the
+    // header arg, never in the URL or any log line.
+    if (api_key) |key| {
+        if (key.len > 0) {
+            try argv.append(a, "-H");
+            try argv.append(a, try std.fmt.allocPrint(a, "x-api-key: {s}", .{key}));
+            try argv.append(a, "-H");
+            try argv.append(a, "anthropic-version: 2023-06-01");
+        }
     }
     try argv.append(a, url);
 
@@ -142,7 +157,7 @@ fn parseRetryAfterMs(_: []const u8) ?u64 {
 /// Fetch a URL unconditionally, returning the body. Errors on any non-2xx.
 /// Retained for callers that do not track validators.
 pub fn httpGet(ctx: *Context, url: []const u8) ![]u8 {
-    const resp = try fetchConditional(ctx, url, "", "");
+    const resp = try fetchConditional(ctx, url, "", "", null);
     return resp.body;
 }
 
