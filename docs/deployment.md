@@ -225,6 +225,50 @@ export FABLE_MONITOR_NOTIFY='curl -fsS -X POST -d "text=$1" https://example.com/
 FABLE_HOME=/persistent/fable-monitor bash dist/install-linux.sh
 ```
 
+### Zo.computer user services (the live deployment)
+
+The reference deployment on Zo does not use `install-linux.sh`; it uses Zo's
+own **user services** (a supervisord-managed process manager), which is simpler
+than provisioning systemd inside the sandbox and gets automatic restarts. Two
+services back the running instance:
+
+- **`fable-monitor-poller`** (mode `process`) — runs a wrapper that exports the
+  state/log paths plus `FABLE_MONITOR_LOOP=1800`, then `exec`s the binary. The
+  in-binary loop (see [Environment variables](#environment-variables)) polls
+  every 30 min, so no external scheduler is needed.
+- **`fable-monitor-ui`** (mode `http`, port 8787) — the read-only dashboard
+  (`serve`; see [ui.md](ui.md)). It is kept **private**: reachable only at its
+  `*.zo.computer` URL while signed in to Zo, never exposed publicly.
+
+Repo at `~/fable_monitor`; durable state at
+`~/fable-monitor-data/{state,events}.jsonl.zst`.
+
+**Build for a baseline CPU.** Build with:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+```
+
+A plain `-Doptimize=ReleaseSafe` targets the *native* CPU of the build host;
+supervisord may run the service on a host whose CPU lacks those instructions,
+and the process dies with **SIGILL** (the service flaps FATAL/BACKOFF). The
+`-Dcpu=baseline` flag pins the generic x86-64 baseline. (Appending `.baseline`
+to the target triple is rejected as `InvalidAbiVersion` — use the separate
+`-Dcpu` flag.) `zstd` is not preinstalled on Zo (`apt-get install -y zstd`);
+`zig`, `git`, and `curl` are.
+
+**Notifications via a Zo automation.** The poller sets
+
+```sh
+export FABLE_MONITOR_NOTIFY='printf "%s\n" "$1" >> ~/fable-monitor-data/pending-alerts.ndjson'
+```
+
+so every tier-1 trip/escalation appends its alert line to a pending file. A Zo
+automation runs every ~15 min; when that file is non-empty it moves it aside
+atomically, emails the alert(s) to the account owner, and removes it. This
+decouples the always-on poller (which only writes the file) from delivery
+(which Zo handles), and is idempotent — an empty file sends nothing.
+
 ### Manual cron / reference
 
 If you prefer a hand-written job, the model is identical: run the binary on a
