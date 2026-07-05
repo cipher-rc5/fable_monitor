@@ -86,20 +86,32 @@ pub fn load(ctx: *Context, opts: LoadOptions) Config {
 
     const raw = std.json.parseFromSliceLeaky(RawConfig, ctx.arena, json, .{ .ignore_unknown_fields = true }) catch |err| {
         log("warning: sources config parse failed ({s}); using embedded default", .{@errorName(err)});
-        return loadDefault(ctx, opts);
+        return loadDefault(ctx, opts) catch |e| fatalResolve(e);
     };
 
-    return resolve(ctx, raw, origin, opts);
+    return resolve(ctx.arena, raw, origin, opts) catch |e| fatalResolve(e);
 }
 
-fn loadDefault(ctx: *Context, opts: LoadOptions) Config {
-    const raw = std.json.parseFromSliceLeaky(RawConfig, ctx.arena, default_json, .{ .ignore_unknown_fields = true }) catch {
-        return .{}; // unreachable in practice: the embedded default is valid JSON
+/// Running with a silently empty source list would make the monitor a no-op
+/// that looks healthy, so an allocation failure while building it is fatal:
+/// log and exit nonzero for the supervisor to catch. (The arena cannot free,
+/// so there is no recovery path.)
+fn fatalResolve(err: Allocator.Error) noreturn {
+    log("fatal: could not build source list ({s})", .{@errorName(err)});
+    std.process.exit(1);
+}
+
+fn loadDefault(ctx: *Context, opts: LoadOptions) Allocator.Error!Config {
+    const raw = std.json.parseFromSliceLeaky(RawConfig, ctx.arena, default_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // The embedded default is a compile-time constant whose validity is
+        // pinned by a test below, so any other parse failure is a build defect.
+        else => unreachable,
     };
-    return resolve(ctx, raw, "embedded default", opts);
+    return resolve(ctx.arena, raw, "embedded default", opts);
 }
 
-fn resolve(ctx: *Context, raw: RawConfig, origin: []const u8, opts: LoadOptions) Config {
+fn resolve(arena: Allocator, raw: RawConfig, origin: []const u8, opts: LoadOptions) Allocator.Error!Config {
     var list: std.ArrayList(Source) = .empty;
     for (raw.sources) |rs| {
         const kind = SourceKind.fromString(rs.kind) orelse {
@@ -123,7 +135,7 @@ fn resolve(ctx: *Context, raw: RawConfig, origin: []const u8, opts: LoadOptions)
             .poll = resolvePoll(rs.poll, tier),
             .lead_time = rs.lead_time,
         };
-        list.append(ctx.arena, src) catch return .{};
+        try list.append(arena, src);
     }
 
     return .{
@@ -206,6 +218,31 @@ test "resolveEnabled applies ONLY then DISABLE" {
     try testing.expect(resolveEnabled("a", true, .{ .only_csv = "a,c" }));
     try testing.expect(!resolveEnabled("a", true, .{ .disable_csv = "a" }));
     try testing.expect(!resolveEnabled("a", false, .{})); // config wins when no override
+}
+
+test "resolve builds the source list and applies defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var raw_sources = [_]RawSource{
+        .{ .id = "probe", .kind = "model_list_probe", .tier = 1, .url = "https://example.test/models" },
+        .{ .id = "bad", .kind = "no_such_kind", .url = "https://example.test/x" }, // skipped
+    };
+    const cfg = try resolve(arena_state.allocator(), .{ .sources = &raw_sources }, "test", .{});
+    try testing.expectEqual(@as(usize, 1), cfg.sources.len);
+    try testing.expectEqualStrings("probe", cfg.sources[0].id);
+    try testing.expectEqual(PollClass.fast, cfg.sources[0].poll);
+    try testing.expectEqualStrings("test", cfg.origin);
+}
+
+test "resolve propagates append failure instead of returning an empty config" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var raw_sources = [_]RawSource{
+        .{ .id = "probe", .kind = "model_list_probe", .tier = 1, .url = "https://example.test/models" },
+    };
+    try testing.expectError(
+        error.OutOfMemory,
+        resolve(failing.allocator(), .{ .sources = &raw_sources }, "test", .{}),
+    );
 }
 
 test "default config parses and yields the expected source kinds" {

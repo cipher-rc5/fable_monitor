@@ -90,8 +90,7 @@ pub fn main(init: std.process.Init) !void {
     // Both poll and export read/write zstd-compressed files, so the `zstd`
     // binary is required (see design-decisions.md).
     if (!fetch.toolAvailable(&ctx, "zstd")) {
-        log("fatal: `zstd` not found on PATH; fable-monitor compresses its outputs with it. Install it or add it to PATH.", .{});
-        return;
+        fatal("fatal: `zstd` not found on PATH; fable-monitor compresses its outputs with it. Install it or add it to PATH.", .{});
     }
 
     if (argv.len > 1) {
@@ -111,8 +110,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, cmd, "ack")) {
             if (argv.len < 3) {
-                log("usage: fable-monitor ack <event_id>", .{});
-                return;
+                fatal("usage: fable-monitor ack <event_id>", .{});
             }
             return poll.acknowledge(&ctx, argv[2]);
         }
@@ -132,15 +130,15 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, cmd, "preflight")) {
             // curl is required for egress checks.
             if (!fetch.toolAvailable(&ctx, "curl")) {
-                log("fatal: `curl` not found on PATH.", .{});
-                return;
+                fatal("fatal: `curl` not found on PATH.", .{});
             }
-            poll.preflight(&ctx, opts) catch {};
+            // A failed preflight must be visible to supervisors, not just in
+            // the log (preflight logs its own findings before erroring).
+            poll.preflight(&ctx, opts) catch |err| fatal("preflight failed: {s}", .{@errorName(err)});
             return;
         }
         if (!std.mem.eql(u8, cmd, "poll")) {
-            log("unknown command '{s}'. {s}", .{ cmd, usage });
-            return;
+            fatal("unknown command '{s}'. {s}", .{ cmd, usage });
         }
         // "poll" falls through to the default below.
     }
@@ -148,8 +146,7 @@ pub fn main(init: std.process.Init) !void {
     // Default: poll. Fetching is delegated to system curl; bail early with a
     // clear message rather than letting every source fail with a spawn error.
     if (!fetch.toolAvailable(&ctx, "curl")) {
-        log("fatal: `curl` not found on PATH; fable-monitor requires the system curl binary. Install it or add it to PATH.", .{});
-        return;
+        fatal("fatal: `curl` not found on PATH; fable-monitor requires the system curl binary. Install it or add it to PATH.", .{});
     }
 
     log("fable-monitor {s}", .{version});
@@ -160,12 +157,25 @@ pub fn main(init: std.process.Init) !void {
     if (envU32(env, "FABLE_MONITOR_LOOP")) |period_s| {
         log("loop mode: polling every {d}s (Ctrl-C to stop)", .{period_s});
         while (true) {
+            // A failed poll iteration is expected weather (network blips);
+            // keep looping. A failed sleep is not: the loop would hot-spin,
+            // so treat it as unrecoverable and let the supervisor restart us.
             poll.run(&ctx, opts) catch |err| log("poll error: {s}", .{@errorName(err)});
-            Io.sleep(io, Io.Duration.fromSeconds(@intCast(period_s)), .awake) catch {};
+            Io.sleep(io, Io.Duration.fromSeconds(@intCast(period_s)), .awake) catch |err| {
+                fatal("fatal: loop sleep failed ({s}); exiting", .{@errorName(err)});
+            };
         }
     }
 
     try poll.run(&ctx, opts);
+}
+
+/// Log a fatal message and exit nonzero. Fatal startup paths must not return
+/// cleanly: launchd/systemd/cron read a zero exit as success, so a log-then-
+/// return would make a dead monitor look healthy.
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    log(fmt, args);
+    std.process.exit(1);
 }
 
 /// Parse an optional unsigned-integer environment variable, ignoring a malformed
