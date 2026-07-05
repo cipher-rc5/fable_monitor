@@ -7,7 +7,9 @@
 //! The page shell (Tailwind v4 + htmx, both from a CDN) is served at `/`; htmx
 //! polls the `/ui/*` fragment endpoints on an interval and swaps the returned
 //! HTML in place. Each request renders from a fresh arena so a long-lived server
-//! does not accumulate memory.
+//! does not accumulate memory. Parsed log/state data is cached across requests
+//! in a `Cache` keyed by file mtime, so the frequent htmx polls only spawn zstd
+//! and re-parse history when the poller actually rewrote a file.
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,12 +39,17 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
     };
     log("UI listening on http://127.0.0.1:{d}  (Ctrl-C to stop)", .{port});
 
+    // Server-lifetime cache of parsed dashboard data; requests are handled one
+    // at a time, so no locking is needed.
+    var cache = Cache.init(std.heap.page_allocator);
+    defer cache.deinit();
+
     while (true) {
         const stream = server.accept(ctx.io) catch |e| {
             log("serve: accept failed: {s}", .{@errorName(e)});
             continue;
         };
-        handleConn(ctx, load_opts, stream) catch |e| {
+        handleConn(ctx, load_opts, &cache, stream) catch |e| {
             log("serve: connection error: {s}", .{@errorName(e)});
         };
     }
@@ -50,7 +57,7 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
 
 /// One request per connection (Connection: close): simplest robust model for a
 /// localhost dashboard, where htmx opens a fresh connection per poll anyway.
-fn handleConn(ctx: *Context, load_opts: config.LoadOptions, stream: net.Stream) !void {
+fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, stream: net.Stream) !void {
     defer stream.close(ctx.io);
 
     var rbuf: [16 * 1024]u8 = undefined;
@@ -79,13 +86,13 @@ fn handleConn(ctx: *Context, load_opts: config.LoadOptions, stream: net.Stream) 
     if (eql(path, "/")) {
         body = shell;
     } else if (eql(path, "/ui/status")) {
-        body = renderStatus(&rctx, load_opts) catch errFrag(a);
+        body = renderStatus(&rctx, load_opts, cache) catch errFrag(a);
     } else if (eql(path, "/ui/sources")) {
-        body = renderSources(&rctx, load_opts) catch errFrag(a);
+        body = renderSources(&rctx, load_opts, cache) catch errFrag(a);
     } else if (eql(path, "/ui/events")) {
-        body = renderEvents(&rctx, target) catch errFrag(a);
+        body = renderEvents(&rctx, cache, target) catch errFrag(a);
     } else if (eql(path, "/ui/alerts")) {
-        body = renderAlerts(&rctx) catch errFrag(a);
+        body = renderAlerts(&rctx, cache) catch errFrag(a);
     } else if (eql(path, "/healthz")) {
         body = "ok";
         ctype = "text/plain; charset=utf-8";
@@ -107,10 +114,10 @@ fn handleConn(ctx: *Context, load_opts: config.LoadOptions, stream: net.Stream) 
 
 // --- fragment renderers -----------------------------------------------------
 
-fn renderStatus(ctx: *Context, load_opts: config.LoadOptions) ![]const u8 {
+fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]const u8 {
     const a = ctx.arena;
-    const rows = try loadEvents(ctx);
-    const st = state_mod.loadState(ctx) catch state_mod.State{};
+    const rows = cache.events(ctx);
+    const st = cache.state(ctx);
     const cfg = config.load(ctx, load_opts);
 
     var last_obs: []const u8 = "—";
@@ -139,10 +146,10 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions) ![]const u8 {
     return out.items;
 }
 
-fn renderSources(ctx: *Context, load_opts: config.LoadOptions) ![]const u8 {
+fn renderSources(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]const u8 {
     const a = ctx.arena;
     const cfg = config.load(ctx, load_opts);
-    const st = state_mod.loadState(ctx) catch state_mod.State{};
+    const st = cache.state(ctx);
 
     var out: std.ArrayList(u8) = .empty;
     try tableHead(a, &out, &.{ "Tier", "ID", "Source", "Kind", "Poll", "Last success", "Last change" });
@@ -164,10 +171,10 @@ fn renderSources(ctx: *Context, load_opts: config.LoadOptions) ![]const u8 {
     return out.items;
 }
 
-fn renderEvents(ctx: *Context, target: []const u8) ![]const u8 {
+fn renderEvents(ctx: *Context, cache: *Cache, target: []const u8) ![]const u8 {
     const a = ctx.arena;
     const limit = queryUint(target, "limit") orelse 25;
-    const rows = try loadEvents(ctx); // ascending by time
+    const rows = cache.events(ctx); // ascending by time
     const start = if (rows.len > limit) rows.len - limit else 0;
 
     var out: std.ArrayList(u8) = .empty;
@@ -193,9 +200,9 @@ fn renderEvents(ctx: *Context, target: []const u8) ![]const u8 {
     return out.items;
 }
 
-fn renderAlerts(ctx: *Context) ![]const u8 {
+fn renderAlerts(ctx: *Context, cache: *Cache) ![]const u8 {
     const a = ctx.arena;
-    const st = state_mod.loadState(ctx) catch state_mod.State{};
+    const st = cache.state(ctx);
 
     var out: std.ArrayList(u8) = .empty;
     try tableHead(a, &out, &.{ "Tier", "Kind", "Title", "First alerted", "Status" });
@@ -223,22 +230,107 @@ fn renderAlerts(ctx: *Context) ![]const u8 {
     return out.items;
 }
 
-// --- data + html helpers ----------------------------------------------------
+// --- parsed-data cache --------------------------------------------------------
 
-fn loadEvents(ctx: *Context) ![]Event {
-    const raw = Io.Dir.cwd().readFileAlloc(ctx.io, ctx.log_path, ctx.arena, .limited(256 * 1024 * 1024)) catch return &.{};
-    const data = zstd.decompress(ctx.io, ctx.arena, raw) catch return &.{};
+/// Parsed dashboard data cached across requests, keyed by file mtime. The htmx
+/// fragments poll every few seconds; without this every poll would spawn zstd
+/// and re-parse the full history. The cache owns its memory via dedicated
+/// arenas (one per file, reset only when that file's mtime moves), so slices it
+/// hands out stay valid for the whole request that borrowed them — never
+/// allocate cached data from a per-request arena.
+const Cache = struct {
+    events_arena: std.heap.ArenaAllocator,
+    events_mtime: i96 = mtime_unset,
+    events_items: []Event = &.{},
+
+    state_arena: std.heap.ArenaAllocator,
+    state_mtime: i96 = mtime_unset,
+    state_val: state_mod.State = .{},
+
+    /// Initial "never loaded" marker; distinct from `mtime_missing` so the
+    /// first request always loads, even when the file does not exist yet.
+    const mtime_unset: i96 = std.math.minInt(i96);
+    /// Marker for "stat failed": lets a file that appears later be picked up.
+    const mtime_missing: i96 = std.math.minInt(i96) + 1;
+
+    fn init(gpa: Allocator) Cache {
+        return .{
+            .events_arena = std.heap.ArenaAllocator.init(gpa),
+            .state_arena = std.heap.ArenaAllocator.init(gpa),
+        };
+    }
+
+    fn deinit(self: *Cache) void {
+        self.events_arena.deinit();
+        self.state_arena.deinit();
+    }
+
+    /// The observation log, parsed and sorted ascending by time. Re-reads only
+    /// when the log file's mtime changed since the cached parse.
+    fn events(self: *Cache, ctx: *Context) []Event {
+        const mt = fileMtime(ctx.io, ctx.log_path);
+        if (self.cachedEventsFor(mt)) |cached| return cached;
+        // Scratch (compressed + decompressed bytes) goes in the request arena;
+        // `refreshEvents` copies what the cache keeps into its own arena.
+        const raw = Io.Dir.cwd().readFileAlloc(ctx.io, ctx.log_path, ctx.arena, .limited(256 * 1024 * 1024)) catch return &.{};
+        const data = zstd.decompress(ctx.io, ctx.arena, raw) catch return &.{};
+        return self.refreshEvents(mt, data);
+    }
+
+    /// The cached parse if it was built from a file with mtime `mt`, else null.
+    fn cachedEventsFor(self: *Cache, mt: i96) ?[]Event {
+        return if (mt == self.events_mtime) self.events_items else null;
+    }
+
+    /// Drop the previous parse and rebuild from `ndjson`, recording `mt` as
+    /// the mtime the parse corresponds to. `.alloc_always` in `parseEventLog`
+    /// guarantees no cached string borrows from `ndjson`.
+    fn refreshEvents(self: *Cache, mt: i96, ndjson: []const u8) []Event {
+        _ = self.events_arena.reset(.retain_capacity);
+        self.events_items = parseEventLog(self.events_arena.allocator(), ndjson) catch &.{};
+        self.events_mtime = mt;
+        return self.events_items;
+    }
+
+    /// The saved state, re-read only when the state file's mtime changed.
+    /// Loaded through a Context clone pointing at the cache's arena so the
+    /// decompressed bytes the parsed State borrows from are cache-owned.
+    fn state(self: *Cache, ctx: *Context) state_mod.State {
+        const mt = fileMtime(ctx.io, ctx.state_path);
+        if (mt == self.state_mtime) return self.state_val;
+        _ = self.state_arena.reset(.retain_capacity);
+        var cctx = ctx.*;
+        cctx.arena = self.state_arena.allocator();
+        self.state_val = state_mod.loadState(&cctx) catch state_mod.State{};
+        self.state_mtime = mt;
+        return self.state_val;
+    }
+};
+
+/// Modification time of `path` in nanoseconds, or `Cache.mtime_missing` when
+/// it cannot be stat'ed (missing file, permissions).
+fn fileMtime(io: Io, path: []const u8) i96 {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return Cache.mtime_missing;
+    return st.mtime.nanoseconds;
+}
+
+/// Parse the decompressed NDJSON log into events sorted ascending by time.
+/// `.alloc_always` copies every string into `arena`, so the result may outlive
+/// the buffer it was parsed from.
+fn parseEventLog(arena: Allocator, data: []const u8) ![]Event {
     var list: std.ArrayList(Event) = .empty;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         const t = std.mem.trim(u8, line, " \r\t");
         if (t.len == 0) continue;
-        const parsed = std.json.parseFromSlice(Event, ctx.arena, t, .{ .ignore_unknown_fields = true }) catch continue;
-        try list.append(ctx.arena, parsed.value);
+        const parsed = std.json.parseFromSlice(Event, arena, t, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
+        try list.append(arena, parsed.value);
     }
     std.mem.sort(Event, list.items, {}, lessByMs);
     return list.items;
 }
+
+// --- data + html helpers ----------------------------------------------------
 
 fn lessByMs(_: void, x: Event, y: Event) bool {
     return x.epoch_ms < y.epoch_ms;
@@ -273,7 +365,19 @@ fn td(a: Allocator, out: *std.ArrayList(u8), inner: []const u8, classes: []const
 
 fn detailCell(a: Allocator, text: []const u8, url: []const u8) []const u8 {
     if (url.len == 0) return text;
+    // Only http/https URLs earn a clickable anchor; anything else (javascript:,
+    // data:, file:, …) is rendered as escaped plain text so a hostile URL in
+    // the log can never become a live link.
+    if (!urlSchemeAllowed(url)) {
+        return std.fmt.allocPrint(a, "{s} <span class=\"text-slate-500 text-xs\">{s}</span>", .{ text, esc(a, url) }) catch text;
+    }
     return std.fmt.allocPrint(a, "{s} <a href=\"{s}\" target=\"_blank\" rel=\"noreferrer\" class=\"text-sky-400 hover:underline\">↗</a>", .{ text, esc(a, url) }) catch text;
+}
+
+/// Anchor-href allowlist: absolute http/https only, scheme case-insensitive.
+fn urlSchemeAllowed(url: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(url, "http://") or
+        std.ascii.startsWithIgnoreCase(url, "https://");
 }
 
 fn tierBadge(tier: u8) []const u8 {
@@ -399,3 +503,85 @@ const shell =
     \\</body>
     \\</html>
 ;
+
+// --- tests --------------------------------------------------------------------
+
+test "detailCell allowlists http/https and renders other schemes as text" {
+    var ta = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ta.deinit();
+    const a = ta.allocator();
+
+    // http/https (any case) get an anchor.
+    try std.testing.expect(std.mem.indexOf(u8, detailCell(a, "t", "https://example.com/x"), "<a href=\"https://example.com/x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detailCell(a, "t", "http://example.com"), "<a href=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detailCell(a, "t", "HtTpS://example.com"), "<a href=") != null);
+
+    // Everything else renders as escaped plain text, never an anchor.
+    for ([_][]const u8{
+        "javascript:alert(1)",
+        "data:text/html,<script>1</script>",
+        "file:///etc/passwd",
+        "vbscript:x",
+        "//example.com/scheme-relative",
+        "httpx://not-http",
+    }) |bad| {
+        const cell = detailCell(a, "t", bad);
+        try std.testing.expect(std.mem.indexOf(u8, cell, "<a ") == null);
+    }
+    // The hostile URL is escaped on the plain-text path.
+    const data_cell = detailCell(a, "t", "data:text/html,<script>1</script>");
+    try std.testing.expect(std.mem.indexOf(u8, data_cell, "<script>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, data_cell, "&lt;script&gt;") != null);
+
+    // No URL: text passes through untouched.
+    try std.testing.expectEqualStrings("t", detailCell(a, "t", ""));
+}
+
+test "parseEventLog parses, sorts ascending, and copies strings out of the input" {
+    var ta = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ta.deinit();
+    const a = ta.allocator();
+
+    const src =
+        "{\"event\":\"advisory\",\"epoch_ms\":2000,\"source_id\":\"s2\"}\n" ++
+        "not json\n" ++
+        "\n" ++
+        "{\"event\":\"baseline\",\"epoch_ms\":1000,\"source_id\":\"s1\"}\n";
+    var buf: [src.len]u8 = undefined;
+    @memcpy(&buf, src);
+
+    const rows = try parseEventLog(a, &buf);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1000), rows[0].epoch_ms);
+    try std.testing.expectEqual(@as(i64, 2000), rows[1].epoch_ms);
+
+    // Clobber the input buffer: parsed strings must survive (`.alloc_always`),
+    // which is what lets the cache free its scratch per request.
+    @memset(&buf, 'x');
+    try std.testing.expectEqualStrings("s1", rows[0].source_id);
+    try std.testing.expectEqualStrings("advisory", rows[1].event);
+}
+
+test "Cache re-parses events only when the mtime moves" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    // Nothing cached yet: any mtime misses, including the missing-file marker.
+    try std.testing.expect(cache.cachedEventsFor(Cache.mtime_missing) == null);
+    try std.testing.expect(cache.cachedEventsFor(100) == null);
+
+    const first = cache.refreshEvents(100, "{\"event\":\"baseline\",\"epoch_ms\":1}");
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+
+    // Same mtime: the cached slice comes back untouched — no re-parse.
+    const hit = cache.cachedEventsFor(100) orelse return error.TestExpectedCacheHit;
+    try std.testing.expectEqual(first.ptr, hit.ptr);
+    try std.testing.expectEqual(first.len, hit.len);
+
+    // Different mtime: stale, and a refresh replaces the parse.
+    try std.testing.expect(cache.cachedEventsFor(101) == null);
+    const second = cache.refreshEvents(101, "{\"epoch_ms\":1}\n{\"epoch_ms\":2}");
+    try std.testing.expectEqual(@as(usize, 2), second.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.cachedEventsFor(101).?.len);
+    try std.testing.expect(cache.cachedEventsFor(100) == null);
+}
