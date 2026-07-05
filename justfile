@@ -7,6 +7,12 @@ demo_state := "/tmp/fable-monitor-demo.jsonl.zst"
 # Matching throwaway log path for the demo.
 demo_log := "/tmp/fable-monitor-demo-events.jsonl.zst"
 
+# Where the installed agent keeps its state/log data. Defaults to the macOS
+# launchd location (dist/install.sh); on the Linux deployment point it at the
+# durable home from dist/install-linux.sh, e.g.
+#   FABLE_DATA_DIR=$HOME/.local/share/fable-monitor just view
+data_dir := env_var_or_default("FABLE_DATA_DIR", env_var("HOME") / "Library/Application Support/fable-monitor")
+
 # Show available recipes (default when you run bare `just`).
 default:
     @just --list
@@ -49,13 +55,13 @@ export out_dir="parquet":
     zig build run -- export {{out_dir}}
 
 # Read the installed agent's observation history as a formatted, colorized table.
-# (Points at the launchd agent's log under Application Support; extra args pass
+# (Points at the installed agent's log under {{data_dir}}; extra args pass
 # through to the subcommand.)
 # Usage: just log                       (whole history)
 #        just log --event changed --limit 20
 #        just log --source fr_bis --plain
 log *args:
-    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" zig build run -- log {{args}}
+    FABLE_MONITOR_LOG="{{data_dir}}/events.jsonl.zst" zig build run -- log {{args}}
 
 # Dataview of the installed agent's recent activity: last 90 days, newest-first.
 # Same reader/flags as `log`, just a different preset.
@@ -63,13 +69,13 @@ log *args:
 #        just view --relevant             (only high-signal events)
 #        just view --days 30 --source fr_bis
 view *args:
-    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" zig build run -- view {{args}}
+    FABLE_MONITOR_LOG="{{data_dir}}/events.jsonl.zst" zig build run -- view {{args}}
 
 # Serve the read-only htmx + Tailwind v4 dashboard over the installed agent's
 # data on http://127.0.0.1:8787 (override the port: `just ui 9000`).
 ui port="8787":
-    FABLE_MONITOR_STATE=~/"Library/Application Support/fable-monitor/state.jsonl.zst" \
-    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" \
+    FABLE_MONITOR_STATE="{{data_dir}}/state.jsonl.zst" \
+    FABLE_MONITOR_LOG="{{data_dir}}/events.jsonl.zst" \
     zig build run -- serve {{port}}
 
 # Inspect a compressed JSONL file (state or log): decompress and pretty-print.
@@ -111,7 +117,7 @@ preflight:
 
 # Coverage audit: each source's last successful fetch and last detected change.
 audit:
-    FABLE_MONITOR_LOG=~/"Library/Application Support/fable-monitor/events.jsonl.zst" FABLE_MONITOR_STATE=~/"Library/Application Support/fable-monitor/state.jsonl.zst" zig build run -- audit
+    FABLE_MONITOR_LOG="{{data_dir}}/events.jsonl.zst" FABLE_MONITOR_STATE="{{data_dir}}/state.jsonl.zst" zig build run -- audit
 
 # Install as a Linux recurring job (Zo.computer / systemd / cron). Override:
 # SCHEDULER=systemd|cron  FABLE_HOME=/persistent/path  FABLE_FAST_INTERVAL=45
@@ -151,7 +157,7 @@ status:
 
 # Tail the installed agent's alert (stdout) and diagnostic (stderr) logs.
 logs:
-    @tail -n 40 ~/"Library/Application Support/fable-monitor"/out.log ~/"Library/Application Support/fable-monitor"/err.log 2>/dev/null || echo "no logs yet (agent hasn't run)"
+    @tail -n 40 "{{data_dir}}"/out.log "{{data_dir}}"/err.log 2>/dev/null || echo "no logs yet (agent hasn't run)"
 
 # Measure memory + CPU of each subcommand. Builds ReleaseSafe, times each under
 # macOS `/usr/bin/time -l` (peak RSS, CPU), then prints the built-in self-report

@@ -93,12 +93,16 @@ structured event) to stop the escalation.
 When set, `FABLE_MONITOR_NOTIFY` runs as `sh -c <cmd> fable-monitor "<alert>"`,
 so reference the message as `$1`. It fires only for high-confidence trips and
 escalations (a tier-1 restoration, or an advisory promoted by corroboration),
-never for an unconfirmed tier-2/3 advisory.
+never for an unconfirmed tier-2/3 advisory. **Always pass `$1` to the tool as
+data (its own argv item), never spliced into code it will evaluate** — the
+alert text quotes remote page content. `tests/notify_quoting.sh` proves the
+osascript form below keeps a hostile message inert.
 
-macOS native notification, no extra install:
+macOS native notification, no extra install (the message is read as
+`item 1 of argv` inside the script, so quotes in it cannot become AppleScript):
 
 ```sh
-export FABLE_MONITOR_NOTIFY='osascript -e "display notification \"$1\" with title \"fable-monitor\""'
+export FABLE_MONITOR_NOTIFY='osascript -e '\''on run argv'\'' -e '\''display notification (item 1 of argv) with title "fable-monitor"'\'' -e '\''end run'\'' -- "$1"'
 ```
 
 With terminal-notifier:
@@ -139,7 +143,11 @@ unattended. The agent's data therefore lives at
 Tunables:
 
 - `FABLE_INTERVAL=<seconds> bash dist/install.sh` overrides the poll cadence
-  (default 1800 = 30 min).
+  (default 60 s, approximating the config's tier-1 fast loop the same way the
+  Linux cron path does). Conditional requests (ETag / 304) keep an unchanged
+  source nearly free, and the in-binary due-cadence still holds tier-2/3
+  sources to `slow_interval_s` regardless of `StartInterval`. Raise it (e.g.
+  `FABLE_INTERVAL=1800`) only if 30-minute tier-1 latency is acceptable.
 - The installer prefers `terminal-notifier` (more reliable from a background
   agent) and falls back to `osascript`. `bash dist/install.sh --dry-run` prints
   the plist it would write without installing.
@@ -189,6 +197,13 @@ bash dist/uninstall-linux.sh               # remove the job (leaves binary/state
 
 Or via the task runner: `just install-linux`, `just install-linux-preview`,
 `just uninstall-linux`.
+
+The `just log` / `view` / `ui` / `audit` / `logs` recipes default to the macOS
+Application Support paths; on Linux point them at the durable home:
+
+```sh
+FABLE_DATA_DIR=$HOME/.local/share/fable-monitor just view
+```
 
 **Scheduler selection** (override with `SCHEDULER=systemd|cron|zo`):
 

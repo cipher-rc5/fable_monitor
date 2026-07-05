@@ -110,7 +110,9 @@ That function is the pipeline: **fetch -> detect -> coalesce -> trip -> emit.**
    event to stdout (and the optional sink file / webhook), fire the notify hook
    for high-confidence trips, and record an `alert` so the same persisting change
    does not re-fire. An unacknowledged high-confidence alert re-fires once after
-   `FABLE_MONITOR_ESCALATE_AFTER` seconds.
+   `FABLE_MONITOR_ESCALATE_AFTER` seconds. Escalation is intentionally
+   **once-per-alert**: a single re-fire, then silence until `ack` — a monitor
+   that keeps nagging trains its operator to ignore it.
 7. **Persist + log + heartbeat.** Save the merged state (FR seen-set capped at
    300, feed seen-set at 500), append this run's events to the observation log,
    print the per-run metrics line, and ping `FABLE_MONITOR_HEARTBEAT_URL` after a
