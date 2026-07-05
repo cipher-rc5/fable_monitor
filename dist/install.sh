@@ -5,9 +5,9 @@
 # LaunchAgent, and load it. Re-running re-installs cleanly. Remove with
 # dist/uninstall.sh.
 #
-#   bash dist/install.sh            # install + load (polls every 30 min)
+#   bash dist/install.sh            # install + load (polls every 60 s)
 #   bash dist/install.sh --dry-run  # just print the plist it would write
-#   FABLE_INTERVAL=600 bash dist/install.sh   # poll every 10 minutes instead
+#   FABLE_INTERVAL=1800 bash dist/install.sh  # poll every 30 minutes instead
 #
 # Why stage under Application Support? On modern macOS, ~/Desktop, ~/Documents,
 # and ~/Downloads are TCC-protected. A background launchd agent can't answer the
@@ -17,7 +17,12 @@
 set -euo pipefail
 
 LABEL="io.zerocreativity.fable-monitor"
-INTERVAL="${FABLE_INTERVAL:-1800}" # seconds between polls (default 30 min)
+# Default cadence: 60 s, approximating the config's tier-1 fast loop
+# (fast_interval_s=45) the same way the Linux cron path does. Conditional GETs
+# (ETag/304) keep an unchanged source nearly free, and the in-binary due-cadence
+# still holds tier-2/3 sources to slow_interval_s regardless of how often the
+# binary runs. Raise it only if 30-minute tier-1 latency is acceptable.
+INTERVAL="${FABLE_INTERVAL:-60}" # seconds between polls (default 60 s)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -45,10 +50,14 @@ TOOLPATH="/usr/bin:/bin:/usr/sbin:/sbin:$(dirname "$(command -v curl)"):$(dirnam
 # 4. Notification command. Prefer terminal-notifier (more reliable from a
 #    background agent); fall back to built-in osascript. The alert text arrives
 #    as "$1" — kept literal here and unescaped by the tool's `sh -c <cmd> … "$1"`.
+#    Both commands receive it as DATA (a plain argv item), never spliced into
+#    code: the osascript fallback reads `item 1 of argv` inside the script, so
+#    a message containing quotes or AppleScript (`do shell script "…"`) renders
+#    inert instead of executing. Covered by tests/notify_quoting.sh.
 if command -v terminal-notifier >/dev/null 2>&1; then
     NOTIFY='terminal-notifier -title "fable-monitor" -message "$1"'
 else
-    NOTIFY='osascript -e "display notification \"$1\" with title \"fable-monitor\""'
+    NOTIFY='osascript -e '\''on run argv'\'' -e '\''display notification (item 1 of argv) with title "fable-monitor"'\'' -e '\''end run'\'' -- "$1"'
 fi
 
 # 5. Generate the plist (to a temp file for --dry-run, else to LaunchAgents).

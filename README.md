@@ -161,7 +161,10 @@ it is safe against shell injection. Example for macOS using terminal-notifier:
 
 Or with osascript and no extra install:
 
-    export FABLE_MONITOR_NOTIFY='osascript -e "display notification \"$1\" with title \"fable-monitor\""'
+    export FABLE_MONITOR_NOTIFY='osascript -e '\''on run argv'\'' -e '\''display notification (item 1 of argv) with title "fable-monitor"'\'' -e '\''end run'\'' -- "$1"'
+
+(The osascript form reads the message via `item 1 of argv` so the text is
+passed as data, never spliced into AppleScript source.)
 
 `FABLE_MONITOR_STATS`, if set, makes each run log a one-line peak-memory/CPU
 summary (process + `curl`/`zstd` children) to stderr. Use `just measure` to
@@ -293,10 +296,11 @@ loads it:
 because macOS TCC-protects `~/Desktop`/`~/Documents`/`~/Downloads`, a background
 agent can't satisfy the consent prompt there and would hang at launch.)
 
-It polls every 30 minutes (and once immediately). Change the cadence with
-`FABLE_INTERVAL` (seconds):
+It polls every 60 seconds (and once immediately) — conditional requests keep
+the fast cadence cheap, and the in-binary due-cadence still holds tier-2/3
+sources to their slower intervals. Change it with `FABLE_INTERVAL` (seconds):
 
-    FABLE_INTERVAL=600 just install      # every 10 minutes
+    FABLE_INTERVAL=1800 just install     # every 30 minutes
 
 Notifications fire only on high-confidence trips and escalations. The installer uses
 [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) if present

@@ -23,7 +23,9 @@
 # useful deployment (the preflight warns if missing):
 #   FABLE_MONITOR_WEBHOOK         structured-event sink (POST target)
 #   FABLE_MONITOR_HEARTBEAT_URL   dead-man's-switch ping target
-#   FABLE_MONITOR_NOTIFY          push hook (alert text arrives as $1)
+#   FABLE_MONITOR_NOTIFY          push hook (alert text arrives as $1; pass it
+#                                 to your tool as data — its own argv item —
+#                                 never spliced into code it evaluates)
 set -euo pipefail
 
 LABEL="fable-monitor"
