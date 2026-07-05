@@ -95,7 +95,7 @@ default. The monitor always has sources to poll.
 | `federal_register_public_inspection` | 2 | Same shape as `federal_register`, but against the public-inspection feed. These documents post *before* official publication, so they are an earlier signal. |
 | `feed_watch` | 3 | Parses RSS / Atom / sitemap structure (guid / link / loc) instead of fingerprinting rendered HTML, which cuts layout-churn false positives. The first poll baselines the entire current backlog without alerting. |
 | `keyword_watch` | 2/3 | The original best-effort signal for pages with no structured feed: hash a normalized, keyword-windowed projection of the page and diff it. Reports *that* something near a keyword changed, not *what*. |
-| `market_watch` | 3 | Records the last prediction-market price and flags a `>= 0.10` move. Advisory only; its purpose is to reveal a coverage gap (a faster source than our own) rather than to auto-action. |
+| `market_watch` | 3 | Records the last prediction-market price and flags a `>= 0.10` move. Advisory only; its purpose is to reveal a coverage gap (a faster source than our own) rather than to auto-action. The shipped `polymarket` entry has `"enabled": false` because its URL still carries a `PLACEHOLDER` market id — flip it on (external config or `FABLE_MONITOR_ONLY`) only after substituting a real id. |
 
 ## Enabling and disabling sources
 

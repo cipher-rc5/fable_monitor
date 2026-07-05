@@ -109,36 +109,107 @@ fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
     return era * 146097 + doe - 719468;
 }
 
-/// Append this run's events to the compressed JSONL history log. Because the
-/// file is a single zstd stream, "append" is a read-modify-write: decompress
-/// the existing log, add this run's lines, recompress, and rewrite. The log
-/// grows with events (not poll frequency), so the rewrite cost stays small.
-/// No-op when the run found nothing new.
+/// Write `data` to `path` atomically: stage it in a uniquely named temp file
+/// in the same directory (a suffix of the target path, so the rename never
+/// crosses filesystems), then rename() over the target. A crash mid-write can
+/// therefore never leave a torn file — readers see the old contents or the new
+/// contents, whole. Shared by the state, event-sink, and log writers.
+pub fn writeFileAtomic(io: Io, arena: Allocator, path: []const u8, data: []const u8) !void {
+    // The random component keeps concurrent writers from colliding on the
+    // staging name (the flock serializes ours, but stay safe against strays).
+    var rnd: [8]u8 = undefined;
+    Io.random(io, &rnd);
+    const suffix = std.mem.readInt(u64, &rnd, .little);
+    const tmp_path = try std.fmt.allocPrint(arena, "{s}.{x}.tmp", .{ path, suffix });
+    {
+        var file = try Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, data);
+    }
+    Io.Dir.cwd().rename(tmp_path, .cwd(), path, io) catch |err| {
+        Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+/// Append this run's events to the compressed JSONL history log as one
+/// independent zstd frame per run. zstd decodes concatenated frames as a
+/// single stream (proven by a test below), so readers (`view`, `export`)
+/// decompress the whole file unchanged, while the append never has to
+/// decompress-recompress history. The rewrite copies the existing *raw* bytes
+/// plus the new frame through a temp file and renames it into place, so a
+/// crash mid-write cannot tear the log. When the existing log cannot be read
+/// at all we refuse to rewrite it — log loudly and append the frame in place
+/// instead, so unreadable history is never silently truncated. No-op when the
+/// run found nothing new.
 pub fn appendLog(io: Io, arena: Allocator, log_path: []const u8, events: []const Event) !void {
     if (events.len == 0) return;
 
     var buf: std.ArrayList(u8) = .empty;
-    if (Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(256 * 1024 * 1024)) catch null) |raw| {
-        const existing = zstd.decompress(io, arena, raw) catch &.{};
-        try buf.appendSlice(arena, existing);
-        if (existing.len > 0 and existing[existing.len - 1] != '\n') {
-            try buf.append(arena, '\n');
-        }
-    }
     for (events) |ev| {
         const line = try std.json.Stringify.valueAlloc(arena, ev, .{});
         try buf.appendSlice(arena, line);
         try buf.append(arena, '\n');
     }
+    const frame = try zstd.compress(io, arena, buf.items);
 
-    const compressed = try zstd.compress(io, arena, buf.items);
-    var file = try Io.Dir.cwd().createFile(io, log_path, .{});
+    const existing: ?[]u8 = Io.Dir.cwd().readFileAlloc(io, log_path, arena, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => {
+            // The log exists but cannot be read back (permissions, I/O, or
+            // memory). Never rewrite what we could not read: append-only.
+            log("error: cannot read {s} ({s}); appending frame without rewrite", .{ log_path, @errorName(err) });
+            try appendRaw(io, log_path, frame);
+            log("appended {d} event(s) to {s} ({d} bytes compressed)", .{ events.len, log_path, frame.len });
+            return;
+        },
+    };
+    const combined = if (existing) |raw| try std.mem.concat(arena, u8, &.{ raw, frame }) else frame;
+    try writeFileAtomic(io, arena, log_path, combined);
+    log("appended {d} event(s) to {s} ({d} bytes compressed)", .{ events.len, log_path, frame.len });
+}
+
+/// Append `bytes` at the current end of an existing file, in place. The
+/// fallback for `appendLog` when the log exists but cannot be read for the
+/// atomic copy-and-rename path.
+fn appendRaw(io: Io, path: []const u8, bytes: []const u8) !void {
+    var file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only });
     defer file.close(io);
-    try file.writeStreamingAll(io, compressed);
-    log("appended {d} event(s) to {s} ({d} bytes compressed)", .{ events.len, log_path, compressed.len });
+    const end = try file.length(io);
+    try file.writePositionalAll(io, bytes, end);
 }
 
 const testing = std.testing;
+
+test "concatenated zstd frames decompress as one stream (appendLog's format)" {
+    // appendLog writes one independent frame per run; `zstd -d` (which
+    // zstd.decompress shells to) must decode the concatenation as one stream.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = testing.io;
+
+    const f1 = try zstd.compress(io, a, "{\"event\":\"one\"}\n");
+    const f2 = try zstd.compress(io, a, "{\"event\":\"two\"}\n");
+    const cat = try std.mem.concat(a, u8, &.{ f1, f2 });
+    const out = try zstd.decompress(io, a, cat);
+    try testing.expectEqualStrings("{\"event\":\"one\"}\n{\"event\":\"two\"}\n", out);
+}
+
+test "writeFileAtomic creates and then replaces the target whole" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = testing.io;
+
+    const path = ".test-fable-monitor-atomic.tmp-target";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeFileAtomic(io, a, path, "first contents");
+    try writeFileAtomic(io, a, path, "second");
+    const got = try Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    try testing.expectEqualStrings("second", got);
+}
 
 test "epochMsFromIso parses dates and instants, round-trips through isoUtc" {
     // 1970-01-01 is epoch 0.

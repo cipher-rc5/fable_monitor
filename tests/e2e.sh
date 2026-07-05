@@ -9,11 +9,20 @@
 # Stages:
 #   1. baseline   -> no trip (models absent, statement suspended)
 #   2. restored   -> tier-1 trip: model-list absent->present on two independent
-#                    probes (coalesced), statement restoration language, plus a
-#                    tier-2 FR advisory; the notify hook fires
+#                    probes (coalesced), statement restoration terms flipping
+#                    absent->present, plus a tier-2 FR advisory; the notify
+#                    hook fires
 #   3. restored#2 -> idempotent: zero new structured events
 #   4. decoy      -> no trip (layout churn + an unrelated "fable" FR document)
-#   5. latency    -> in-process fixture poll completes under a bound
+#   5. negation   -> no trip: suspension copy that *names* the controlled ids
+#                    ("claude-fable-5 remains restricted") and uses the
+#                    ambiguous restoration stems in negation contexts ("not
+#                    available", "will return when authorized") must not read
+#                    as restoration
+#   6. restored#3 -> the real restoration still trips high after the negation
+#                    decoy (the decoy neither poisoned the term baseline nor
+#                    recorded false model presence)
+#   7. latency    -> in-process fixture poll completes under a bound
 #
 # Usage: bash tests/e2e.sh   (run from the repo root; needs a built binary)
 set -uo pipefail
@@ -75,7 +84,35 @@ poll decoy    "$TMP/ev4b.ndjson"
 [ "$(events "$TMP/ev4b.ndjson")" -eq 0 ] || fail "decoy tripped an alert"
 pass "decoy: no trip"
 
-# --- 5. latency bound on the in-process fixture pipeline -------------------
+# --- 5. negation decoy: suspension copy naming the ids/terms must not trip -
+export FABLE_MONITOR_STATE="$TMP/state4.jsonl.zst"
+export FABLE_MONITOR_LOG="$TMP/log4.jsonl.zst"
+NOTIFY2_FILE="$TMP/notify2.txt"
+export FABLE_MONITOR_NOTIFY="echo \">>> \$1\" >> $NOTIFY2_FILE"
+poll baseline       "$TMP/ev5a.ndjson"   # fresh baseline
+poll decoy_negation "$TMP/ev5b.ndjson"
+# The reworded suspension copy may raise a context-shift advisory, but no
+# restoration trip, no model presence, and nothing high-confidence.
+! grep -q '"event_id":"statement_restored"' "$TMP/ev5b.ndjson" 2>/dev/null \
+    || fail "negation decoy tripped statement_restored"
+! grep -q 'model_present' "$TMP/ev5b.ndjson" 2>/dev/null \
+    || fail "negation decoy recorded a model_present event"
+! grep -q '"confidence":"high"' "$TMP/ev5b.ndjson" 2>/dev/null \
+    || fail "negation decoy emitted a high-confidence event"
+[ ! -f "$NOTIFY2_FILE" ] || ! grep -q 'RESTORATION' "$NOTIFY2_FILE" \
+    || fail "negation decoy fired the notify hook"
+pass "negation decoy: no trip (ids/terms only in suspension context)"
+
+# --- 6. the real restoration still trips after the negation decoy ----------
+poll restored "$TMP/ev6.ndjson"
+grep -q '"event_id":"statement_restored".*"confidence":"high"' "$TMP/ev6.ndjson" \
+    || fail "post-decoy restoration did not trip statement_restored high"
+grep -q '"event_id":"model_present:claude-fable-5".*"confidence":"high"' "$TMP/ev6.ndjson" \
+    || fail "post-decoy restoration did not trip model_present:claude-fable-5 high"
+grep -q 'RESTORATION' "$NOTIFY2_FILE" || fail "notify hook did not fire on post-decoy restoration"
+pass "post-decoy restoration: trips high, notify fired"
+
+# --- 7. latency bound on the in-process fixture pipeline -------------------
 export FABLE_MONITOR_STATE="$TMP/state3.jsonl.zst"
 export FABLE_MONITOR_LOG="$TMP/log3.jsonl.zst"
 poll baseline /dev/null

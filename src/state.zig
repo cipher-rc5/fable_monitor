@@ -8,8 +8,15 @@
 //! `status` (per-source timing for cadence and the coverage audit), and `alert`
 //! (alert-once / escalation bookkeeping) records. A v1 file loads unchanged: the
 //! absent `meta` defaults `version` to 1 and the unknown-to-v1 record kinds
-//! simply never appear. Conversely a v2 file's extra records are ignored by the
-//! lenient parse if read by an older build. So history is never invalidated.
+//! simply never appear. Conversely a newer file's extra records are ignored by
+//! the lenient parse if read by an older build. So history is never invalidated.
+//!
+//! v3 adds `term` records: the restoration terms present (negation-aware) on a
+//! statement source at its last poll — the baseline an absent-to-present term
+//! transition is detected against. A v1/v2 file loads unchanged; its missing
+//! term records read as "term baseline unknown" (`version <
+//! term_records_version`), which the statement detector treats as
+//! re-baseline-without-tripping rather than an unknowable transition.
 
 const std = @import("std");
 const Io = std.Io;
@@ -17,9 +24,26 @@ const context = @import("context.zig");
 const Context = context.Context;
 const log = context.log;
 const zstd = @import("zstd.zig");
+const events_mod = @import("events.zig");
 
 /// The current on-disk state format version written by `saveState`.
-pub const current_version: u32 = 2;
+pub const current_version: u32 = 3;
+
+/// The first format version whose files carry `term` records. A loaded state
+/// older than this has no restoration-term baseline: the statement detector
+/// must re-baseline the term set instead of trusting an unknowable transition.
+pub const term_records_version: u32 = 3;
+
+/// Settled alert records (acknowledged or already escalated) older than this
+/// window are pruned on save, so the alert list does not grow monotonically.
+/// Unsettled alerts are kept regardless of age — they may still escalate.
+pub const alert_retention_ms: i64 = 90 * std.time.ms_per_day;
+
+/// True when an alert record is settled and old enough to drop on save.
+pub fn alertExpired(a: State.AlertRecord, now_ms: i64) bool {
+    if (!a.acknowledged and !a.escalated) return false;
+    return now_ms - a.epoch_ms > alert_retention_ms;
+}
 
 pub const State = struct {
     version: u32 = 1, // 1 when loaded from a pre-meta (v1) file
@@ -27,6 +51,7 @@ pub const State = struct {
     keyword_hashes: []KeywordHash = &.{},
     validators: []Validator = &.{},
     model_present: []ModelPresent = &.{},
+    terms_present: []TermPresent = &.{},
     feed_seen: []FeedSeen = &.{},
     source_status: []SourceStatus = &.{},
     alerts: []AlertRecord = &.{},
@@ -49,6 +74,15 @@ pub const State = struct {
     pub const ModelPresent = struct {
         id: []const u8, // source id
         model: []const u8, // model identifier seen present
+    };
+
+    /// One (source, restoration-term) pair observed present — negation-aware,
+    /// see `sources.presentOutsideNegation` — on a statement page. The set of
+    /// these is the baseline an absent-to-present term transition (the
+    /// statement_watch trip condition) is detected against.
+    pub const TermPresent = struct {
+        id: []const u8, // source id
+        term: []const u8, // restoration term seen present
     };
 
     /// One (source, entry-key) pair already seen in a feed, so re-seeing it is
@@ -110,6 +144,13 @@ pub const State = struct {
         return false;
     }
 
+    pub fn termIsPresent(self: State, source_id: []const u8, term: []const u8) bool {
+        for (self.terms_present) |t| {
+            if (std.mem.eql(u8, t.id, source_id) and std.mem.eql(u8, t.term, term)) return true;
+        }
+        return false;
+    }
+
     pub fn feedHasSeen(self: State, source_id: []const u8, key: []const u8) bool {
         for (self.feed_seen) |f| {
             if (std.mem.eql(u8, f.id, source_id) and std.mem.eql(u8, f.key, key)) return true;
@@ -145,6 +186,7 @@ pub const StateRecord = struct {
     etag: []const u8 = "",
     last_modified: []const u8 = "",
     model: []const u8 = "",
+    term: []const u8 = "",
     key: []const u8 = "",
     event_identity: []const u8 = "",
     epoch_ms: i64 = 0,
@@ -181,6 +223,7 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8) !State {
     var hashes: std.ArrayList(State.KeywordHash) = .empty;
     var validators: std.ArrayList(State.Validator) = .empty;
     var models: std.ArrayList(State.ModelPresent) = .empty;
+    var terms: std.ArrayList(State.TermPresent) = .empty;
     var feeds: std.ArrayList(State.FeedSeen) = .empty;
     var statuses: std.ArrayList(State.SourceStatus) = .empty;
     var alerts: std.ArrayList(State.AlertRecord) = .empty;
@@ -201,6 +244,8 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8) !State {
             try validators.append(arena, .{ .id = r.id, .etag = r.etag, .last_modified = r.last_modified });
         } else if (std.mem.eql(u8, r.kind, "model")) {
             if (r.id.len > 0 and r.model.len > 0) try models.append(arena, .{ .id = r.id, .model = r.model });
+        } else if (std.mem.eql(u8, r.kind, "term")) {
+            if (r.id.len > 0 and r.term.len > 0) try terms.append(arena, .{ .id = r.id, .term = r.term });
         } else if (std.mem.eql(u8, r.kind, "feed")) {
             if (r.id.len > 0 and r.key.len > 0) try feeds.append(arena, .{ .id = r.id, .key = r.key });
         } else if (std.mem.eql(u8, r.kind, "status")) {
@@ -229,15 +274,63 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8) !State {
         .keyword_hashes = hashes.items,
         .validators = validators.items,
         .model_present = models.items,
+        .terms_present = terms.items,
         .feed_seen = feeds.items,
         .source_status = statuses.items,
         .alerts = alerts.items,
     };
 }
 
+/// The advisory inter-process lock serializing every state read-modify-write
+/// (poll and ack), taken on a `.lock` file next to the state path so an
+/// overlapping cron poll or a concurrent ack cannot discard each other's
+/// writes. flock semantics: the lock is released automatically when the
+/// process exits, so a crash never wedges the monitor.
+pub const StateLock = struct {
+    file: Io.File,
+
+    pub fn release(self: *StateLock, io: Io) void {
+        self.file.close(io); // closing the descriptor drops the flock
+    }
+};
+
+/// How long `acquireLock` waits on a competing holder before failing loudly,
+/// and the pause between nonblocking attempts.
+const lock_wait_ms: i64 = 5000;
+const lock_retry_ms: i64 = 100;
+
+/// Take the exclusive advisory lock on `<state_path>.lock`, blocking briefly
+/// (nonblocking flock retried up to `lock_wait_ms`) and then failing with
+/// `error.StateLockHeld` rather than deadlocking forever.
+pub fn acquireLock(ctx: *Context) !StateLock {
+    const lock_path = try std.fmt.allocPrint(ctx.arena, "{s}.lock", .{ctx.state_path});
+    var waited: i64 = 0;
+    while (true) {
+        const file = Io.Dir.cwd().createFile(ctx.io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (waited >= lock_wait_ms) {
+                    log("error: state lock {s} still held after {d}ms; is another poll/ack running?", .{ lock_path, waited });
+                    return error.StateLockHeld;
+                }
+                Io.sleep(ctx.io, Io.Duration.fromMilliseconds(lock_retry_ms), .awake) catch {};
+                waited += lock_retry_ms;
+                continue;
+            },
+            else => return err,
+        };
+        return .{ .file = file };
+    }
+}
+
 /// Serialize `state` as line-delimited JSON records, zstd-compress, and write
-/// the result to the state file (a full rewrite, as before). Writes a leading
-/// `meta` record stamping the current format version.
+/// the result to the state file (a full rewrite, staged through a temp file
+/// and renamed into place so a crash never leaves a torn state). Writes a
+/// leading `meta` record stamping the current format version, and prunes
+/// settled alert records past `alert_retention_ms`.
 pub fn saveState(ctx: *Context, state: State) !void {
     var buf: std.ArrayList(u8) = .empty;
     try writeRecord(ctx.arena, &buf, .{ .kind = "meta", .version = current_version });
@@ -253,6 +346,9 @@ pub fn saveState(ctx: *Context, state: State) !void {
     for (state.model_present) |m| {
         try writeRecord(ctx.arena, &buf, .{ .kind = "model", .id = m.id, .model = m.model });
     }
+    for (state.terms_present) |t| {
+        try writeRecord(ctx.arena, &buf, .{ .kind = "term", .id = t.id, .term = t.term });
+    }
     for (state.feed_seen) |f| {
         try writeRecord(ctx.arena, &buf, .{ .kind = "feed", .id = f.id, .key = f.key });
     }
@@ -266,6 +362,7 @@ pub fn saveState(ctx: *Context, state: State) !void {
         });
     }
     for (state.alerts) |a| {
+        if (alertExpired(a, ctx.epoch_ms)) continue;
         try writeRecord(ctx.arena, &buf, .{
             .kind = "alert",
             .event_identity = a.event_identity,
@@ -280,9 +377,7 @@ pub fn saveState(ctx: *Context, state: State) !void {
     }
 
     const compressed = try zstd.compress(ctx.io, ctx.arena, buf.items);
-    var file = try Io.Dir.cwd().createFile(ctx.io, ctx.state_path, .{});
-    defer file.close(ctx.io);
-    try file.writeStreamingAll(ctx.io, compressed);
+    try events_mod.writeFileAtomic(ctx.io, ctx.arena, ctx.state_path, compressed);
     log("state written to {s} (v{d}, {d} bytes compressed)", .{ ctx.state_path, current_version, compressed.len });
 }
 
@@ -302,6 +397,50 @@ pub fn capTail(items: [][]const u8, max: usize) [][]const u8 {
 }
 
 const testing = std.testing;
+
+test "alertExpired prunes only settled alerts past the retention window" {
+    const now: i64 = alert_retention_ms + 1_000_000;
+    const old_ack = State.AlertRecord{ .event_identity = "a", .epoch_ms = 1, .acknowledged = true };
+    const old_esc = State.AlertRecord{ .event_identity = "b", .epoch_ms = 1, .escalated = true };
+    const old_open = State.AlertRecord{ .event_identity = "c", .epoch_ms = 1 };
+    const new_ack = State.AlertRecord{ .event_identity = "d", .epoch_ms = now - 1000, .acknowledged = true };
+    try testing.expect(alertExpired(old_ack, now));
+    try testing.expect(alertExpired(old_esc, now));
+    try testing.expect(!alertExpired(old_open, now)); // unsettled: kept forever
+    try testing.expect(!alertExpired(new_ack, now)); // settled but recent: kept
+}
+
+test "acquireLock excludes a second holder until released" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const io = testing.io;
+
+    var ctx = Context{
+        .io = io,
+        .arena = arena_state.allocator(),
+        .state_path = ".test-fable-monitor-state.jsonl.zst",
+        .log_path = "",
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    const lock_path = ".test-fable-monitor-state.jsonl.zst.lock";
+    defer Io.Dir.cwd().deleteFile(io, lock_path) catch {};
+
+    var lock = try acquireLock(&ctx);
+    // While held, a nonblocking exclusive flock on the same path must refuse
+    // (flock conflicts across open file descriptions, even in one process).
+    try testing.expectError(error.WouldBlock, Io.Dir.cwd().createFile(io, lock_path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }));
+    lock.release(io);
+
+    // Released: the lock is immediately acquirable again.
+    var again = try acquireLock(&ctx);
+    again.release(io);
+}
 
 test "capTail keeps only the most recent entries" {
     var items = [_][]const u8{ "1", "2", "3", "4", "5" };
@@ -361,4 +500,38 @@ test "v2 records round-trip through parse" {
     try testing.expect(st.feedHasSeen("google_news", "https://example.com/a"));
     try testing.expectEqual(@as(i64, 900), st.statusFor("fr_bis").?.last_success_ms);
     try testing.expectEqual(@as(i64, 1234), st.alertFor("model:claude-fable-5").?.epoch_ms);
+    // A pre-v3 file has no term records: the baseline reads as unknown.
+    try testing.expect(st.version < term_records_version);
+    try testing.expectEqual(@as(usize, 0), st.terms_present.len);
+}
+
+test "v3 term records parse and gate the transition baseline" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const data =
+        \\{"kind":"meta","version":3}
+        \\{"kind":"term","id":"anthropic_statement","term":"available"}
+    ;
+    const st = try parse(arena_state.allocator(), data);
+    try testing.expect(st.version >= term_records_version);
+    try testing.expect(st.termIsPresent("anthropic_statement", "available"));
+    try testing.expect(!st.termIsPresent("anthropic_statement", "restored"));
+    try testing.expect(!st.termIsPresent("other_source", "available"));
+}
+
+test "term records survive a writeRecord/parse round-trip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: std.ArrayList(u8) = .empty;
+    try writeRecord(arena, &buf, .{ .kind = "meta", .version = current_version });
+    try writeRecord(arena, &buf, .{ .kind = "term", .id = "anthropic_statement", .term = "restored" });
+    try writeRecord(arena, &buf, .{ .kind = "term", .id = "anthropic_statement", .term = "general license" });
+
+    const st = try parse(arena, buf.items);
+    try testing.expectEqual(current_version, st.version);
+    try testing.expect(st.termIsPresent("anthropic_statement", "restored"));
+    try testing.expect(st.termIsPresent("anthropic_statement", "general license"));
+    try testing.expectEqual(@as(usize, 2), st.terms_present.len);
 }
