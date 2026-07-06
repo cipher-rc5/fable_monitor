@@ -82,6 +82,8 @@ pub fn innerText(block: []const u8, comptime tag: []const u8) ?[]const u8 {
     const open = "<" ++ tag;
     const close = "</" ++ tag ++ ">";
     const s = std.mem.indexOf(u8, block, open) orelse return null;
+    // A block truncated right at the open tag has no content to read.
+    if (s + open.len >= block.len) return null;
     // Reject a longer tag that merely shares this prefix (e.g. "link" vs "linkfoo").
     const after = block[s + open.len];
     if (after != '>' and after != ' ' and after != '\t' and after != '\r' and after != '\n' and after != '/') return null;
@@ -169,4 +171,96 @@ test "innerText does not match a tag that only shares a prefix" {
     // "<link>" must not be satisfied by "<linkbase>".
     try testing.expect(innerText("<linkbase>x</linkbase>", "link") == null);
     try testing.expectEqualStrings("y", innerText("<link>y</link>", "link").?);
+}
+
+test "innerText tolerates truncated blocks" {
+    // Block ends exactly at the open tag — there is no byte after it to read.
+    try testing.expect(innerText("<guid", "guid") == null);
+    try testing.expect(innerText("x<guid", "guid") == null);
+    // Open tag never closed with '>'.
+    try testing.expect(innerText("<guid attr", "guid") == null);
+    // Content present but closing tag missing.
+    try testing.expect(innerText("<guid>tag:x", "guid") == null);
+    // Empty input.
+    try testing.expect(innerText("", "guid") == null);
+}
+
+test "parse tolerates malformed and truncated feeds" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Truncated mid-tag / at the open tag end: no entries, no crash.
+    try testing.expectEqual(@as(usize, 0), (try parse(arena, "<item")).len);
+    try testing.expectEqual(@as(usize, 0), (try parse(arena, "<item>")).len);
+    try testing.expectEqual(@as(usize, 0), (try parse(arena, "<item><guid>tag:x</gui")).len);
+    // Empty block: no key, so the entry is dropped.
+    try testing.expectEqual(@as(usize, 0), (try parse(arena, "<item></item>")).len);
+    // Child tag truncated right at its open tag inside a closed block.
+    try testing.expectEqual(@as(usize, 0), (try parse(arena, "<item><guid</item>")).len);
+    // Unclosed CDATA: the wrapper is not stripped, but nothing crashes.
+    const cdata = try parse(arena, "<item><guid><![CDATA[k</guid></item>");
+    try testing.expectEqual(@as(usize, 1), cdata.len);
+    try testing.expectEqualStrings("<![CDATA[k", cdata[0].key);
+    // CDATA prefix with no content or suffix at all.
+    try testing.expectEqual(@as(usize, 1), (try parse(arena, "<item><guid><![CDATA[</guid></item>")).len);
+}
+
+test "parse tolerates truncation at every byte boundary" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const doc =
+        "<rss><channel><item><title><![CDATA[Fable]]></title>" ++
+        "<link href=\"https://a.example/x\">https://a.example/x</link>" ++
+        "<guid>tag:a</guid><pubDate>Mon, 01 Jan 2026 12:00:00 GMT</pubDate></item>" ++
+        "<entry><id>urn:x</id><updated>2026-01-01T00:00:00Z</updated></entry>" ++
+        "<url><loc>https://a.example/s</loc><lastmod>2026-06-28</lastmod></url></channel></rss>";
+    var cut: usize = 0;
+    while (cut <= doc.len) : (cut += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        _ = try parse(arena_state.allocator(), doc[0..cut]);
+    }
+}
+
+/// Deterministic 64-bit LCG for the fuzz tests below: fixed seed, no wall
+/// clock or environment, so failures reproduce exactly.
+fn lcgNext(state: *u64) usize {
+    state.* = state.* *% 6364136223846793005 +% 1442695040888963407;
+    return @intCast(state.* >> 33);
+}
+
+test "fuzz: parse never crashes on mutated feed bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    const seed_doc =
+        "<rss><channel><item><title><![CDATA[Fable]]></title>" ++
+        "<link href=\"https://a.example/x\">https://a.example/x</link>" ++
+        "<guid>tag:a</guid><pubDate>Mon, 01 Jan 2026 12:00:00 GMT</pubDate></item>" ++
+        "<entry><id>urn:x</id><updated>2026-01-01T00:00:00Z</updated></entry>" ++
+        "<url><loc>https://a.example/s</loc><lastmod>2026-06-28</lastmod></url></channel></rss>";
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    var buf: [seed_doc.len]u8 = undefined;
+
+    var iter: usize = 0;
+    while (iter < 3000) : (iter += 1) {
+        @memcpy(&buf, seed_doc);
+        // A handful of point mutations, biased toward structural bytes.
+        const n_mut = 1 + lcgNext(&rng) % 8;
+        var m: usize = 0;
+        while (m < n_mut) : (m += 1) {
+            const at = lcgNext(&rng) % buf.len;
+            buf[at] = switch (lcgNext(&rng) % 4) {
+                0 => '<',
+                1 => '>',
+                2 => '/',
+                else => @truncate(lcgNext(&rng)),
+            };
+        }
+        // Then truncate at a random point, so every mutation is also exercised
+        // against a torn tail.
+        const cut = lcgNext(&rng) % (buf.len + 1);
+        _ = arena_state.reset(.retain_capacity);
+        _ = try parse(arena_state.allocator(), buf[0..cut]);
+    }
 }

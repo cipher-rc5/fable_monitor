@@ -22,15 +22,18 @@
         <key>FABLE_MONITOR_LOG</key>
         <string>/path/to/fable_monitor/fable_monitor_events.jsonl.zst</string>
         <key>FABLE_MONITOR_NOTIFY</key>
-        <string>osascript -e "display notification \"$1\" with title \"fable-monitor\""</string>
+        <!-- Alert text is read via `item 1 of argv` — passed as data, never
+             spliced into AppleScript source (see tests/notify_quoting.sh). -->
+        <string>osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "fable-monitor"' -e 'end run' -- "$1"</string>
         <!-- Ensure curl and zstd are resolvable. -->
         <key>PATH</key>
         <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
     </dict>
 
-    <!-- Poll every 30 minutes. -->
+    <!-- Poll every 60 seconds (matches the installer default; conditional
+         requests keep the fast cadence cheap). -->
     <key>StartInterval</key>
-    <integer>1800</integer>
+    <integer>60</integer>
 
     <!-- Also run once at load. -->
     <key>RunAtLoad</key>

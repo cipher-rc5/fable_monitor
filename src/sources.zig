@@ -18,16 +18,76 @@ pub const keywords = [_][]const u8{ "fable", "mythos", "anthropic" };
 ///
 /// All entries are substrings matched against lowercased, tag-stripped text
 /// (see `html.normalizeHtml`), so a stem covers its inflections: "return"
-/// catches "returns"/"returning"/"returned", "relaunch" catches "relaunched".
-/// Stems are kept long enough to avoid loose hits (e.g. "return", not "back",
-/// which would match "background"/"feedback").
+/// catches "returns"/"returning"/"returned", "relaunch" catches "relaunched",
+/// "reauthoriz" catches "reauthorized"/"reauthorization". Stems are kept long
+/// enough to avoid loose hits (e.g. "return", not "back", which would match
+/// "background"/"feedback").
+///
+/// The ambiguous stems ("available", "return", "authorization") appear in
+/// suspension copy at least as often as in restoration copy ("not available",
+/// "will return when authorized"), so the statement detector matches every
+/// term through `presentOutsideNegation` rather than a bare substring test.
 pub const restoration_terms = [_][]const u8{
-    "restored",      "resumed",         "reinstated", "reauthorized",
+    "restored",      "resumed",         "reinstated", "reauthoriz",
     "available",     "lifted",          "rescinded",  "vacated",
     "authorization", "general license", "return",     "relaunch",
     "reintroduc",    "re-enabl",        "reenabl",    "now live",
     "live again",    "back online",
 };
+
+/// Negation / suspension / conditional markers that disqualify a nearby term
+/// or identifier hit. Matched as substrings of the lowercased window around a
+/// hit, so "not available", "no longer available", "will return when
+/// authorized", or a listing note like "claude-fable-5 remains restricted"
+/// never reads as restoration. Tokens carry spaces where a bare stem would
+/// over-match (" if " not "if"; "not " also covers "cannot "; "no " covers
+/// "no longer"/"no authorization"; "n't " covers "won't"/"isn't";
+/// "restricted" not "restrict", which would match the restorative
+/// "restrictions have been lifted").
+pub const negation_markers = [_][]const u8{
+    "not ",       "n't ",        "no ",     "never",
+    "without",    " unless",     " until",  " when ",
+    " if ",       " once ",      "pending", "suspend",
+    "restricted", "unavailable", "revoked", "remains",
+    "denied",     "prohibited",  "blocked",
+};
+
+/// Bytes inspected on each side of a hit for `negation_markers`. Kept small so
+/// distant prose ("... export restrictions." two sentences later) cannot veto
+/// a genuinely clean hit.
+pub const negation_window = 40;
+
+/// True iff `needle` occurs in `text` at least once *outside* a negation /
+/// suspension context. `text` must already be normalized (lowercased,
+/// whitespace-collapsed; see `html.normalizeHtml`). A hit is disqualified when
+/// it is embedded in a longer word ("available" inside "unavailable") or when
+/// any negation marker appears within `negation_window` bytes on either side.
+/// One clean hit anywhere suffices: a page can say both "previously
+/// unavailable" and "now available" and still read as present.
+///
+/// The embedded-word check rejects a preceding *letter* only: every real
+/// embedding ("unavailable", "preauthorization") abuts a letter, while tag
+/// stripping can legitimately leave a digit abutting the next identifier
+/// ("<li>claude-opus-4-8</li><li>claude-fable-5</li>" normalizes to
+/// "claude-opus-4-8claude-fable-5").
+pub fn presentOutsideNegation(text: []const u8, needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, needle)) |pos| {
+        start = pos + needle.len;
+        if (pos > 0 and std.ascii.isAlphabetic(text[pos - 1])) continue;
+        const lo = pos -| negation_window;
+        const hi = @min(text.len, pos + needle.len + negation_window);
+        if (!containsMarker(text[lo..hi])) return true;
+    }
+    return false;
+}
+
+fn containsMarker(window: []const u8) bool {
+    for (negation_markers) |m| {
+        if (std.mem.indexOf(u8, window, m) != null) return true;
+    }
+    return false;
+}
 
 /// The model identifiers whose presence in a public model listing is the
 /// single most decisive confirmation that access is live again. The default
@@ -177,4 +237,36 @@ test "restoration vocabulary covers the 'returning' family without loose hits" {
     // Common substrings that must NOT trip the new stems (regression guard).
     try testing.expect(!hit("background information on export policy"));
     try testing.expect(!hit("we appreciate your feedback on the rollback"));
+}
+
+test "presentOutsideNegation rejects negated / suspension contexts" {
+    const p = presentOutsideNegation;
+
+    // The ambiguous stems inside the negation contexts the audit called out.
+    try testing.expect(!p("claude fable 5 is not available", "available"));
+    try testing.expect(!p("fable 5 is unavailable in your region", "available"));
+    try testing.expect(!p("fable 5 is no longer available", "available"));
+    try testing.expect(!p("fable 5 won't be available this quarter", "available"));
+    try testing.expect(!p("access will return when authorized by bis", "return"));
+    try testing.expect(!p("access will not return this quarter", "return"));
+    try testing.expect(!p("no authorization has been granted", "authorization"));
+    try testing.expect(!p("preauthorization forms are unrelated", "authorization"));
+
+    // Mere-mention suspension copy naming a controlled identifier.
+    try testing.expect(!p("note: claude-fable-5 remains restricted", "claude-fable-5"));
+    try testing.expect(!p("claude-fable-5 is currently suspended", "claude-fable-5"));
+    try testing.expect(!p("claude-fable-5 access is revoked pending review", "claude-fable-5"));
+
+    // Clean hits must still read as present.
+    try testing.expect(p("fable 5 is available to all customers today", "available"));
+    try testing.expect(p("access to fable 5 has been restored", "restored"));
+    try testing.expect(p("fable 5 returns effective today", "return"));
+    try testing.expect(p("reauthorization granted for fable 5", "reauthoriz"));
+    try testing.expect(p("models claude-opus-4-8 claude-fable-5 claude-mythos-5", "claude-fable-5"));
+    // Tag stripping can leave a digit abutting the next listing entry; that
+    // is a real hit, unlike a letter-embedded one.
+    try testing.expect(p("claude-opus-4-8claude-fable-5", "claude-fable-5"));
+    // One clean hit wins even when another occurrence is negated (beyond the
+    // negation window).
+    try testing.expect(p("previously not available in some regions. as of this morning, access for fable 5 is available worldwide", "available"));
 }

@@ -11,7 +11,7 @@ const Context = context.Context;
 const log = context.log;
 
 const version = @import("build_options").version;
-const user_agent = std.fmt.comptimePrint("fable-monitor/{s} (+https://github.com/; export-control availability monitor)", .{version});
+const user_agent = std.fmt.comptimePrint("fable-monitor/{s} (+https://github.com/cipher-rc5/fable_monitor; export-control availability monitor)", .{version});
 const ua_header = std.fmt.comptimePrint("User-Agent: {s}", .{user_agent});
 const fetch_timeout_s = "30";
 const post_timeout_s = "10";
@@ -26,9 +26,19 @@ pub const Response = struct {
     body: []u8 = &.{},
     etag: []const u8 = "",
     last_modified: []const u8 = "",
+    retry_after: []const u8 = "",
     not_modified: bool = false,
     fetch_ms: i64 = 0,
 };
+
+/// A cwd-relative temp-file name unique to this invocation (random suffix),
+/// so concurrent monitor processes sharing a working directory can never
+/// clobber each other's staging files.
+fn tmpName(io: Io, arena: std.mem.Allocator, comptime kind: []const u8) ![]u8 {
+    var buf: [8]u8 = undefined;
+    io.random(&buf);
+    return std.fmt.allocPrint(arena, ".fable-monitor." ++ kind ++ ".{x}.ztmp", .{std.mem.readInt(u64, &buf, .little)});
+}
 
 /// Fetch `url`, sending conditional-request headers when `etag`/`last_modified`
 /// are non-empty. A 304 returns quickly with `not_modified = true` and no body.
@@ -46,7 +56,7 @@ pub fn fetchConditional(
 
     // Honor 429 once, then give up for this poll (the next tick retries).
     if (resp.status == 429) {
-        const wait_ms = @min(max_backoff_ms, parseRetryAfterMs(resp.body) orelse 1000);
+        const wait_ms = @min(max_backoff_ms, parseRetryAfterMs(resp.retry_after) orelse 1000);
         log("source fetch got 429 for {s}; backing off {d}ms then retrying once", .{ url, wait_ms });
         Io.sleep(ctx.io, Io.Duration.fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
         resp = try curlOnce(ctx, url, etag, last_modified, api_key);
@@ -61,17 +71,20 @@ pub fn fetchConditional(
 }
 
 /// One curl invocation. Body is captured on stdout; response headers are dumped
-/// to a per-url temp file and parsed for status, ETag, and Last-Modified. When
-/// `api_key` is non-empty, the Anthropic auth headers are added (used only by
-/// the `api_probe` source kind); the key value goes only into the `-H` arg and
-/// is never logged. All other callers pass null and get a byte-for-byte
-/// identical argv.
+/// to a per-invocation temp file and parsed for status, ETag, Last-Modified,
+/// and Retry-After. When `api_key` is non-empty, the Anthropic auth headers
+/// are added (used only by the `api_probe` source kind); the key value is
+/// staged in a 0600 temp file read via curl's `-H @file` form, so it never
+/// appears in the process argument list (visible via ps) and is never logged.
+/// All other callers pass null and get a byte-for-byte identical argv.
 fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []const u8, api_key: ?[]const u8) !Response {
-    const hdr_path = try std.fmt.allocPrint(ctx.arena, ".fable-monitor.hdr.{x}.ztmp", .{std.hash.Wyhash.hash(0, url)});
+    const a = ctx.arena;
+    const hdr_path = try tmpName(ctx.io, a, "hdr");
     defer Io.Dir.cwd().deleteFile(ctx.io, hdr_path) catch {};
+    var key_path: ?[]const u8 = null;
+    defer if (key_path) |p| Io.Dir.cwd().deleteFile(ctx.io, p) catch {};
 
     var argv: std.ArrayList([]const u8) = .empty;
-    const a = ctx.arena;
     try argv.appendSlice(a, &.{
         "curl",       "-sS",                                                            "-L",
         "--max-time", fetch_timeout_s,                                                  "-D",
@@ -86,12 +99,20 @@ fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []c
         try argv.append(a, "-H");
         try argv.append(a, try std.fmt.allocPrint(a, "If-Modified-Since: {s}", .{last_modified}));
     }
-    // Anthropic API auth (api_probe only). The key is placed solely in the
-    // header arg, never in the URL or any log line.
+    // Anthropic API auth (api_probe only). The header line lives in a 0600
+    // temp file that curl reads via `-H @file`, keeping the key out of argv,
+    // the URL, and any log line.
     if (api_key) |key| {
         if (key.len > 0) {
+            const p = try tmpName(ctx.io, a, "key");
+            {
+                var f = try Io.Dir.cwd().createFile(ctx.io, p, .{ .permissions = .fromMode(0o600) });
+                defer f.close(ctx.io);
+                try f.writeStreamingAll(ctx.io, try std.fmt.allocPrint(a, "x-api-key: {s}", .{key}));
+            }
+            key_path = p;
             try argv.append(a, "-H");
-            try argv.append(a, try std.fmt.allocPrint(a, "x-api-key: {s}", .{key}));
+            try argv.append(a, try std.fmt.allocPrint(a, "@{s}", .{p}));
             try argv.append(a, "-H");
             try argv.append(a, "anthropic-version: 2023-06-01");
         }
@@ -121,7 +142,7 @@ fn curlOnce(ctx: *Context, url: []const u8, etag: []const u8, last_modified: []c
 }
 
 /// Parse a curl header dump: take the final HTTP status line (after any
-/// redirects) and the last ETag / Last-Modified seen.
+/// redirects) and the last ETag / Last-Modified / Retry-After seen.
 fn parseHeaders(headers: []const u8) Response {
     var resp = Response{};
     var lines = std.mem.splitScalar(u8, headers, '\n');
@@ -137,6 +158,8 @@ fn parseHeaders(headers: []const u8) Response {
             resp.etag = v;
         } else if (headerValue(line, "last-modified:")) |v| {
             resp.last_modified = v;
+        } else if (headerValue(line, "retry-after:")) |v| {
+            resp.retry_after = v;
         }
     }
     return resp;
@@ -149,9 +172,10 @@ fn headerValue(line: []const u8, name_lower: []const u8) ?[]const u8 {
 }
 
 /// Best-effort Retry-After parse: only the integer-seconds form (the HTTP-date
-/// form is rare here and a fixed fallback is fine for a fast poller).
-fn parseRetryAfterMs(_: []const u8) ?u64 {
-    return null;
+/// form is rare here and the fixed fallback is fine for a fast poller).
+fn parseRetryAfterMs(retry_after: []const u8) ?u64 {
+    const secs = std.fmt.parseInt(u64, std.mem.trim(u8, retry_after, " \t"), 10) catch return null;
+    return std.math.mul(u64, secs, 1000) catch null;
 }
 
 /// Fetch a URL unconditionally, returning the body. Errors on any non-2xx.
@@ -166,7 +190,7 @@ pub fn httpGet(ctx: *Context, url: []const u8) ![]u8 {
 /// is staged in a temp file because `std.process.run` cannot feed child stdin.
 pub fn postJson(ctx: *Context, url: []const u8, json: []const u8) void {
     const a = ctx.arena;
-    const tmp = std.fmt.allocPrint(a, ".fable-monitor.post.{x}.ztmp", .{std.hash.Wyhash.hash(0, url)}) catch return;
+    const tmp = tmpName(ctx.io, a, "post") catch return;
     {
         var f = Io.Dir.cwd().createFile(ctx.io, tmp, .{}) catch |err| {
             log("webhook: could not stage payload: {s}", .{@errorName(err)});
@@ -243,6 +267,32 @@ test "parseHeaders takes the final status and last validators" {
 test "parseHeaders recognizes a 304" {
     const r = parseHeaders("HTTP/2 304\r\n\r\n");
     try testing.expectEqual(@as(u32, 304), r.status);
+}
+
+test "parseHeaders captures Retry-After" {
+    const r = parseHeaders("HTTP/2 429\r\nRetry-After: 120\r\n\r\n");
+    try testing.expectEqual(@as(u32, 429), r.status);
+    try testing.expectEqualStrings("120", r.retry_after);
+}
+
+test "parseRetryAfterMs handles the integer-seconds form only" {
+    try testing.expectEqual(@as(?u64, 120_000), parseRetryAfterMs("120"));
+    try testing.expectEqual(@as(?u64, 0), parseRetryAfterMs("0"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs(""));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("Fri, 31 Dec 2027 23:59:59 GMT"));
+    // Overflow of the seconds-to-ms conversion must not wrap.
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterMs("18446744073709551615"));
+}
+
+test "tmpName is unique per invocation" {
+    const a = testing.allocator;
+    const one = try tmpName(testing.io, a, "hdr");
+    defer a.free(one);
+    const two = try tmpName(testing.io, a, "hdr");
+    defer a.free(two);
+    try testing.expect(!std.mem.eql(u8, one, two));
+    try testing.expect(std.mem.startsWith(u8, one, ".fable-monitor.hdr."));
+    try testing.expect(std.mem.endsWith(u8, one, ".ztmp"));
 }
 
 test "headerValue is case-insensitive on the name" {

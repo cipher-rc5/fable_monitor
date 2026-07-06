@@ -40,7 +40,7 @@
       "tier": 1,
       "label": "Anthropic Fable/Mythos access statement",
       "url": "https://www.anthropic.com/news/fable-mythos-access",
-      "match": ["restored", "resumed", "reinstated", "reauthorized", "available", "lifted", "rescinded", "return", "relaunch", "reintroduc", "now live", "fable", "mythos"],
+      "match": ["restored", "resumed", "reinstated", "reauthoriz", "available", "lifted", "rescinded", "return", "relaunch", "reintroduc", "now live", "fable", "mythos"],
       "poll": "fast",
       "lead_time": "decisive: restoration language on the dedicated statement page"
     },
@@ -108,7 +108,8 @@
       "tier": 3,
       "label": "Polymarket (Anthropic access restoration)",
       "url": "https://clob.polymarket.com/prices-history?market=PLACEHOLDER&interval=1h",
-      "lead_time": "advisory: market movement before our own trip flags a coverage gap"
+      "enabled": false,
+      "lead_time": "advisory: market movement before our own trip flags a coverage gap; disabled until a real market id replaces PLACEHOLDER"
     }
   ]
 }
