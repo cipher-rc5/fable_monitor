@@ -185,6 +185,42 @@ pub fn httpGet(ctx: *Context, url: []const u8) ![]u8 {
     return resp.body;
 }
 
+/// A realistic desktop-Chrome identity. The honest `fable-monitor/…` UA is right
+/// for the high-frequency poller, but several government sources
+/// (federalregister.gov, ecfr.gov) serve a "Request Access" CAPTCHA wall to any
+/// non-browser UA. The reader is a user-initiated, on-demand fetch that mirrors
+/// exactly what the user's own browser would load, so it presents a browser UA
+/// and browser-like Accept headers to get the real article HTML.
+const browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// One-shot GET with a browser identity, following redirects. Used by the reader
+/// proxy. Returns the body on any 2xx; errors otherwise. No conditional headers
+/// or validators — the reader has its own TTL cache.
+pub fn httpGetBrowser(ctx: *Context, url: []const u8) ![]u8 {
+    const a = ctx.arena;
+    const argv = [_][]const u8{
+        "curl",                 "-sS",
+        "-L",                   "--max-time",
+        fetch_timeout_s,        "-A",
+        browser_ua,             "-H",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "-H",                   "Accept-Language: en-US,en;q=0.9",
+        url,
+    };
+    const result = try std.process.run(a, ctx.io, .{
+        .argv = &argv,
+        .stdout_limit = .limited(16 * 1024 * 1024),
+    });
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            log("reader curl exit {d} for {s}: {s}", .{ code, url, std.mem.trim(u8, result.stderr, " \n\r") });
+            return error.FetchFailed;
+        },
+        else => return error.FetchFailed,
+    }
+    return result.stdout;
+}
+
 /// POST a JSON payload to `url` (the structured-event webhook). Best-effort:
 /// logs and swallows failure so a webhook outage never fails a poll. The body
 /// is staged in a temp file because `std.process.run` cannot feed child stdin.
