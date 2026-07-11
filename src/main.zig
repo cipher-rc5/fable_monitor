@@ -154,13 +154,39 @@ pub fn main(init: std.process.Init) !void {
     // Optional internal loop for environments without a sub-minute scheduler.
     // FABLE_MONITOR_LOOP=<seconds> runs the poll repeatedly, sleeping between
     // ticks; due-based cadence inside the poll still gates per-tier work.
+    //
+    // Loop mode must NOT reuse the startup `ctx`: every poll allocates from
+    // `ctx.arena` (fetched bodies, decompressed state, JSON, formatted strings)
+    // and appends to `ctx.events`, and one-shot mode relies on process exit to
+    // reclaim all of it. Reusing one process-lifetime arena across ticks would
+    // grow memory without bound until the host is starved. Instead each tick
+    // gets a fresh arena that is reset afterward, a fresh (empty) event list,
+    // and a freshly stamped poll time. `.retain_capacity` keeps the backing
+    // buffer so steady-state memory settles at one poll's high-water mark
+    // rather than thrashing the allocator. Nothing needs to survive between
+    // ticks: the poll reloads prior state from disk every cycle.
     if (envU32(env, "FABLE_MONITOR_LOOP")) |period_s| {
         log("loop mode: polling every {d}s (Ctrl-C to stop)", .{period_s});
+        var tick_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer tick_arena.deinit();
         while (true) {
+            const tick_a = tick_arena.allocator();
+            const tick_now = Io.Timestamp.now(io, .real);
+            var tick_ctx = Context{
+                .io = io,
+                .arena = tick_a,
+                .state_path = state_path,
+                .log_path = log_path,
+                .notify_cmd = notify_cmd,
+                .observed_at = events.isoUtc(tick_a, tick_now.toSeconds()) catch |err|
+                    fatal("fatal: timestamp format failed ({s}); exiting", .{@errorName(err)}),
+                .epoch_ms = tick_now.toMilliseconds(),
+            };
             // A failed poll iteration is expected weather (network blips);
             // keep looping. A failed sleep is not: the loop would hot-spin,
             // so treat it as unrecoverable and let the supervisor restart us.
-            poll.run(&ctx, opts) catch |err| log("poll error: {s}", .{@errorName(err)});
+            poll.run(&tick_ctx, opts) catch |err| log("poll error: {s}", .{@errorName(err)});
+            _ = tick_arena.reset(.retain_capacity);
             Io.sleep(io, Io.Duration.fromSeconds(@intCast(period_s)), .awake) catch |err| {
                 fatal("fatal: loop sleep failed ({s}); exiting", .{@errorName(err)});
             };
