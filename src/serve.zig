@@ -145,7 +145,7 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, "<div class=\"grid grid-cols-2 md:grid-cols-4 gap-3\">");
     try card(a, &out, "Sources", try std.fmt.allocPrint(a, "{d}", .{cfg.sources.len}), "text-sky-400");
-    try card(a, &out, "Events logged", try std.fmt.allocPrint(a, "{d}", .{rows.len}), "text-sky-400");
+    try card(a, &out, "Events logged", try std.fmt.allocPrint(a, "{d}", .{cache.events_total}), "text-sky-400");
     try card(a, &out, "Active alerts", try std.fmt.allocPrint(a, "{d}", .{active_alerts}), alert_accent);
     try card(a, &out, "Last observed", esc(a, last_obs), "text-slate-200");
     try out.appendSlice(a, "</div>");
@@ -330,6 +330,10 @@ const Cache = struct {
     events_arena: std.heap.ArenaAllocator,
     events_mtime: i96 = mtime_unset,
     events_items: []Event = &.{},
+    /// Total non-empty lines in the log, counted every refresh. `events_items`
+    /// is capped to the most recent `events_cap`, so this — not `events_items.len`
+    /// — is the true "events logged" figure the status card reports.
+    events_total: usize = 0,
 
     state_arena: std.heap.ArenaAllocator,
     state_mtime: i96 = mtime_unset,
@@ -373,9 +377,21 @@ const Cache = struct {
     /// Drop the previous parse and rebuild from `ndjson`, recording `mt` as
     /// the mtime the parse corresponds to. `.alloc_always` in `parseEventLog`
     /// guarantees no cached string borrows from `ndjson`.
+    ///
+    /// Only the most recent `events_cap` lines are parsed. The observation log
+    /// is append-only and grows without bound, and `parseEventLog` copies every
+    /// string of every event into `events_arena` (`.alloc_always`); parsing the
+    /// full history would size that server-lifetime arena to the whole log — the
+    /// larger the history, the larger the resident set, forever. Capping keeps
+    /// the cache's memory bounded to a fixed window regardless of log size. The
+    /// dashboard only surfaces recent events (the events panel requests the last
+    /// 60; search indexes this window), so nothing reachable in the UI is lost.
+    /// `events_total` still reports the true count for the status card.
     fn refreshEvents(self: *Cache, mt: i96, ndjson: []const u8) []Event {
         _ = self.events_arena.reset(.retain_capacity);
-        self.events_items = parseEventLog(self.events_arena.allocator(), ndjson) catch &.{};
+        const tr = tailByLines(ndjson, events_cap);
+        self.events_items = parseEventLog(self.events_arena.allocator(), tr.tail) catch &.{};
+        self.events_total = tr.total;
         self.events_mtime = mt;
         return self.events_items;
     }
@@ -400,6 +416,44 @@ const Cache = struct {
 fn fileMtime(io: Io, path: []const u8) i96 {
     const st = Io.Dir.cwd().statFile(io, path, .{}) catch return Cache.mtime_missing;
     return st.mtime.nanoseconds;
+}
+
+/// How many of the most recent log lines the UI parses and caches. Bounds the
+/// events cache's resident memory to a fixed window (~3 KiB/event retained, so
+/// this is on the order of ~15 MiB) instead of growing with the full, unbounded
+/// log history. Chosen well above what any panel shows (the events table pulls
+/// the last 60) to keep a deep search corpus.
+const events_cap: usize = 5000;
+
+const TailResult = struct { tail: []const u8, total: usize };
+
+/// The last `max_lines` non-empty lines of `data`, plus the total non-empty
+/// line count. Two allocation-free byte scans — far cheaper than JSON-parsing
+/// lines only to discard them. The log is appended in chronological order, so
+/// the tail is the most recent history.
+fn tailByLines(data: []const u8, max_lines: usize) TailResult {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse data.len;
+        if (std.mem.trim(u8, data[i..nl], " \r\t").len != 0) total += 1;
+        i = nl + 1;
+    }
+    if (total <= max_lines) return .{ .tail = data, .total = total };
+
+    // Skip the oldest (total - max_lines) non-empty lines; keep the rest.
+    const skip = total - max_lines;
+    var seen: usize = 0;
+    i = 0;
+    while (i < data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse data.len;
+        if (std.mem.trim(u8, data[i..nl], " \r\t").len != 0) {
+            if (seen == skip) break;
+            seen += 1;
+        }
+        i = nl + 1;
+    }
+    return .{ .tail = data[i..], .total = total };
 }
 
 /// Parse the decompressed NDJSON log into events sorted ascending by time.
@@ -1168,6 +1222,41 @@ test "parseEventLog parses, sorts ascending, and copies strings out of the input
     @memset(&buf, 'x');
     try std.testing.expectEqualStrings("s1", rows[0].source_id);
     try std.testing.expectEqualStrings("advisory", rows[1].event);
+}
+
+test "tailByLines returns the last N non-empty lines and the true total" {
+    const data = "a\n\nb\n  \nc\nd\n"; // 4 non-empty lines: a, b, c, d
+    const all = tailByLines(data, 10);
+    try std.testing.expectEqual(@as(usize, 4), all.total);
+    try std.testing.expectEqualStrings(data, all.tail); // under the cap: whole slice
+
+    const tail = tailByLines(data, 2);
+    try std.testing.expectEqual(@as(usize, 4), tail.total); // total still counts all
+    try std.testing.expectEqualStrings("c\nd\n", tail.tail); // only the last two kept
+
+    const one = tailByLines(data, 1);
+    try std.testing.expectEqualStrings("d\n", one.tail);
+}
+
+test "refreshEvents caps parsed events but reports the full total" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    // Build a log with more lines than a small cap by re-running through the
+    // real parse path. events_cap is large, so exercise the tail helper for the
+    // cap boundary and rely on this for the total-vs-kept wiring.
+    const log_ndjson =
+        "{\"epoch_ms\":1}\n" ++
+        "{\"epoch_ms\":2}\n" ++
+        "{\"epoch_ms\":3}\n";
+    const rows = cache.refreshEvents(1, log_ndjson);
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqual(@as(usize, 3), cache.events_total);
+
+    // The cap boundary itself: keeping the newest two of three by line order.
+    const capped = tailByLines(log_ndjson, 2);
+    try std.testing.expectEqual(@as(usize, 3), capped.total);
+    try std.testing.expectEqualStrings("{\"epoch_ms\":2}\n{\"epoch_ms\":3}\n", capped.tail);
 }
 
 test "Cache re-parses events only when the mtime moves" {
