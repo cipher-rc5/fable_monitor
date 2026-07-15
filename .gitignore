@@ -26,6 +26,11 @@ parquet/
 .env
 .env.*
 !.env.example
+# Local opencode config — carries provider API-key env refs, never committed.
+opencode.json
+# direnv: `.envrc` is a committable loader (references .env, embeds no secrets);
+# `.envrc.local` is for personal overrides and must never be committed.
+.envrc.local
 
 # ---------------------------------------------------------------------------
 # macOS

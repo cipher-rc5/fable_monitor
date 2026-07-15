@@ -4,29 +4,51 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
 
-      - name: Install runtime dependencies (curl, zstd)
-        run: sudo apt-get update && sudo apt-get install -y zstd curl
+      - name: Install runtime and validation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl python3-venv shellcheck zstd
+          python3 -m venv "$RUNNER_TEMP/parquet-reader"
+          "$RUNNER_TEMP/parquet-reader/bin/pip" install --disable-pip-version-check duckdb==1.3.2
 
-      - name: Run tests
-        run: zig build test --summary all
+      - name: Run local parity gate
+        env:
+          PARQUET_PYTHON: ${{ runner.temp }}/parquet-reader/bin/python
+        run: bash scripts/ci.sh
 
-      - name: Build
-        run: zig build
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
-      - name: End-to-end fixture replay
-        run: bash tests/e2e.sh
-
-      - name: Check formatting
-        run: zig fmt --check src/ build.zig
+      - name: Scan for leaked credentials (betterleaks)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            ghcr.io/betterleaks/betterleaks@sha256:7a43a20d40be02a9c13801a6485f7bea9d9cdba512263440eae972103c5291f1 \
+            git /repo -v --config /repo/.betterleaks.toml

@@ -1,0 +1,61 @@
+name: Dependency Updates
+
+on:
+  schedule:
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  renovate:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require update token
+        env:
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$RENOVATE_TOKEN" || {
+            echo "RENOVATE_TOKEN must have repo and workflow scopes" >&2
+            exit 1
+          }
+
+      - name: Configure Renovate
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            '{' \
+            '  "platform": "github",' \
+            "  \"repositories\": [\"$REPOSITORY\"]," \
+            '  "onboarding": false,' \
+            '  "requireConfig": "optional",' \
+            '  "enabledManagers": ["github-actions", "custom.regex"],' \
+            '  "customManagers": [' \
+            '    {' \
+            '      "customType": "regex",' \
+            '      "managerFilePatterns": ["/(^|/)\\.github/workflows/.*\\.yml$/", "/^justfile$/"],' \
+            '      "matchStrings": ["(?<depName>ghcr\\.io/betterleaks/betterleaks)@sha256:(?<currentDigest>[a-f0-9]{64})"],' \
+            '      "datasourceTemplate": "docker"' \
+            '    },' \
+            '    {' \
+            '      "customType": "regex",' \
+            '      "managerFilePatterns": ["/(^|/)\\.github/workflows/.*\\.yml$/"],' \
+            '      "matchStrings": ["(?<depName>duckdb)==(?<currentValue>[0-9.]+)"],' \
+            '      "datasourceTemplate": "pypi"' \
+            '    }' \
+            '  ],' \
+            '  "dependencyDashboard": true,' \
+            '  "labels": ["dependencies"]' \
+            '}' > /tmp/renovate.json
+
+      - name: Update pinned GitHub Actions
+        uses: renovatebot/github-action@9ba84f1ade243f8c2ce5b223df61cf23dc094584 # v43.0.13
+        with:
+          configurationFile: /tmp/renovate.json
+          token: ${{ secrets.RENOVATE_TOKEN }}

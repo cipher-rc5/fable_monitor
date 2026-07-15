@@ -1,0 +1,23 @@
+# betterleaks configuration — secret-scanning for fable-monitor.
+# https://github.com/betterleaks/betterleaks
+#
+# Extends the tool's built-in ruleset so all default detectors stay active; the
+# blocks below only add project-specific allowlisting to suppress known false
+# positives. Run locally with `just scan-secrets`; CI runs it on every push/PR.
+[extend]
+useDefault = true
+
+# Global allowlist: paths and patterns that are safe by construction and must
+# never trip a finding.
+[[allowlists]]
+description = "fable-monitor known-safe paths and placeholders"
+# Config templates and docs reference env-var indirections, never real secrets.
+paths = [
+  '''\.betterleaks\.toml$''',
+  '''\.env\.example$''',
+]
+# opencode.json (and any config) references secrets as `{env:NAME}` indirections
+# — these are placeholders, not credentials. Allowlist the exact shape.
+regexes = [
+  '''\{env:[A-Z0-9_]+\}''',
+]

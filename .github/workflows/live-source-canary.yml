@@ -1,0 +1,43 @@
+name: Live source canary
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+    inputs:
+      enabled:
+        description: Run the live public-source canary
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    if: >-
+      (github.event_name == 'schedule' && vars.ENABLE_LIVE_CANARY == 'true') ||
+      (github.event_name == 'workflow_dispatch' && inputs.enabled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Install public-source runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl zstd
+
+      - name: Build isolated canary binary
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Poll one public source with sanitized output
+        run: bash tests/live_source_canary.sh
