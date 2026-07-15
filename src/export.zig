@@ -10,7 +10,8 @@ const zstd = @import("zstd.zig");
 const context = @import("context.zig");
 const Context = context.Context;
 const log = context.log;
-const Event = @import("events.zig").Event;
+const events = @import("events.zig");
+const Event = events.Event;
 const state = @import("state.zig");
 
 /// `fable-monitor export [out_dir]`: project the history log and the current
@@ -23,11 +24,6 @@ pub fn exportParquet(ctx: *Context, out_dir: []const u8) !void {
     try exportState(ctx, out_dir);
 }
 
-/// Read a whole file into the arena, or return null if it is absent/unreadable.
-fn readFileMaybe(ctx: *Context, path: []const u8) ?[]u8 {
-    return Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(256 * 1024 * 1024)) catch null;
-}
-
 /// Build a one-row slice of Parquet values in the arena.
 fn row(a: Allocator, values: []const parquet.Value) ![]const parquet.Value {
     return a.dupe(parquet.Value, values);
@@ -35,11 +31,10 @@ fn row(a: Allocator, values: []const parquet.Value) ![]const parquet.Value {
 
 fn exportEvents(ctx: *Context, out_dir: []const u8) !void {
     const a = ctx.arena;
-    const raw = readFileMaybe(ctx, ctx.log_path) orelse {
+    const data = events.readLog(ctx.io, a, ctx.log_path) catch {
         log("no observation log at {s}; skipping events.parquet", .{ctx.log_path});
         return;
     };
-    const data = try zstd.decompress(ctx.io, a, raw);
 
     const columns = [_]parquet.Column{
         .{ .name = "observed_at", .type = .str },

@@ -21,7 +21,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const zstd = @import("zstd.zig");
 const events = @import("events.zig");
 const Event = events.Event;
 const log = @import("context.zig").log;
@@ -113,11 +112,10 @@ pub fn run(io: Io, arena: Allocator, log_path: []const u8, args: []const [:0]con
         null;
 
     // Load + decompress + parse the log.
-    const raw = Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(256 * 1024 * 1024)) catch {
+    const data = events.readLog(io, arena, log_path) catch {
         log("no observation log at {s} (run a poll first, or set FABLE_MONITOR_LOG)", .{log_path});
         return;
     };
-    const data = try zstd.decompress(io, arena, raw);
 
     var rows: std.ArrayList(Event) = .empty;
     var lines = std.mem.splitScalar(u8, data, '\n');

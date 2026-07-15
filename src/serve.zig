@@ -4,11 +4,11 @@
 //! mutates anything, so it is safe to leave running alongside the scheduled
 //! poller, which owns the same files.
 //!
-//! The page shell (Tailwind v4 + htmx, both from a CDN) is served at `/`; htmx
-//! polls the `/ui/*` fragment endpoints on an interval and swaps the returned
+//! The page shell and its small dependency-free local assets are served at `/`;
+//! browser JavaScript polls the `/ui/*` fragment endpoints and swaps the returned
 //! HTML in place. Each request renders from a fresh arena so a long-lived server
 //! does not accumulate memory. Parsed log/state data is cached across requests
-//! in a `Cache` keyed by file mtime, so the frequent htmx polls only spawn zstd
+//! in a `Cache` keyed by file mtime, so the frequent browser polls only spawn zstd
 //! and re-parse history when the poller actually rewrote a file.
 
 const std = @import("std");
@@ -24,10 +24,22 @@ const events = @import("events.zig");
 const Event = events.Event;
 const state_mod = @import("state.zig");
 const config = @import("config.zig");
-const zstd = @import("zstd.zig");
 const fetch = @import("fetch.zig");
+const poll = @import("poll.zig");
 
 pub const default_port: u16 = 8787;
+
+const app_css = @embedFile("serve/app.css");
+const app_js = @embedFile("serve/app.js");
+
+const security_headers = [_]http.Header{
+    .{ .name = "content-security-policy", .value = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src https: data:; font-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'" },
+    .{ .name = "x-content-type-options", .value = "nosniff" },
+    .{ .name = "x-frame-options", .value = "DENY" },
+    .{ .name = "referrer-policy", .value = "no-referrer" },
+    .{ .name = "permissions-policy", .value = "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
+    .{ .name = "cache-control", .value = "no-store" },
+};
 
 /// Bind 127.0.0.1:port and serve until interrupted. `load_opts` mirrors the
 /// poll-time source resolution so the sources panel shows the same set the
@@ -40,8 +52,8 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
     };
     log("UI listening on http://127.0.0.1:{d}  (Ctrl-C to stop)", .{port});
 
-    // Server-lifetime cache of parsed dashboard data; requests are handled one
-    // at a time, so no locking is needed.
+    // Deliberately bounded to one active request. Cache mutation is single-owner,
+    // and the Zig 0.16 net.Stream API has no accepted-socket deadline setter.
     var cache = Cache.init(std.heap.page_allocator);
     defer cache.deinit();
 
@@ -57,7 +69,7 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
 }
 
 /// One request per connection (Connection: close): simplest robust model for a
-/// localhost dashboard, where htmx opens a fresh connection per poll anyway.
+/// localhost dashboard, where the browser opens a fresh connection per poll.
 fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, stream: net.Stream) !void {
     defer stream.close(ctx.io);
 
@@ -83,13 +95,28 @@ fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, strea
     const path = pathOf(target);
 
     var body: ?[]const u8 = null;
+    var status: http.Status = .ok;
     var ctype: []const u8 = "text/html; charset=utf-8";
-    if (eql(path, "/")) {
+    if (req.head.method != .GET and req.head.method != .HEAD) {
+        body = "method not allowed";
+        status = .method_not_allowed;
+        ctype = "text/plain; charset=utf-8";
+    } else if (eql(path, "/")) {
         body = shell;
+    } else if (eql(path, "/static/app.css")) {
+        body = app_css;
+        ctype = "text/css; charset=utf-8";
+    } else if (eql(path, "/static/app.js")) {
+        body = app_js;
+        ctype = "text/javascript; charset=utf-8";
     } else if (eql(path, "/ui/status")) {
-        body = renderStatus(&rctx, load_opts, cache) catch errFrag(a);
+        const fragment = configFragment(renderStatus(&rctx, load_opts, cache));
+        body = fragment.body;
+        status = fragment.status;
     } else if (eql(path, "/ui/sources")) {
-        body = renderSources(&rctx, load_opts, cache) catch errFrag(a);
+        const fragment = configFragment(renderSources(&rctx, load_opts, cache));
+        body = fragment.body;
+        status = fragment.status;
     } else if (eql(path, "/ui/events")) {
         body = renderEvents(&rctx, cache, target) catch errFrag(a);
     } else if (eql(path, "/ui/alerts")) {
@@ -98,24 +125,74 @@ fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, strea
         body = renderSearchIndex(&rctx, cache) catch "[]";
         ctype = "application/json; charset=utf-8";
     } else if (eql(path, "/reader")) {
-        body = renderReader(&rctx, cache, target) catch readerError(a, "reader error — check the server log");
+        const fragment = configFragment(renderReader(&rctx, load_opts, cache, target));
+        body = fragment.body;
+        status = fragment.status;
     } else if (eql(path, "/healthz")) {
         body = "ok";
+        ctype = "text/plain; charset=utf-8";
+    } else if (eql(path, "/readyz")) {
+        const ready = readiness(&rctx, load_opts);
+        body = ready.message;
+        status = if (ready.ready) .ok else .service_unavailable;
         ctype = "text/plain; charset=utf-8";
     }
 
     if (body) |html| {
+        var headers: [security_headers.len + 1]http.Header = undefined;
+        @memcpy(headers[0..security_headers.len], &security_headers);
+        headers[security_headers.len] = .{ .name = "content-type", .value = ctype };
         try req.respond(html, .{
+            .status = status,
             .keep_alive = false,
-            .extra_headers = &.{.{ .name = "content-type", .value = ctype }},
+            .extra_headers = &headers,
         });
     } else {
+        var headers: [security_headers.len + 1]http.Header = undefined;
+        @memcpy(headers[0..security_headers.len], &security_headers);
+        headers[security_headers.len] = .{ .name = "content-type", .value = "text/html; charset=utf-8" };
         try req.respond("<p class=\"text-rose-400\">404 — not found</p>", .{
             .status = .not_found,
             .keep_alive = false,
-            .extra_headers = &.{.{ .name = "content-type", .value = "text/html; charset=utf-8" }},
+            .extra_headers = &headers,
         });
     }
+}
+
+const Readiness = struct { ready: bool, message: []const u8 };
+
+fn readiness(ctx: *Context, load_opts: config.LoadOptions) Readiness {
+    const cfg = config.loadChecked(ctx, load_opts) catch return .{ .ready = false, .message = "configuration unavailable" };
+    const now_ms = Io.Timestamp.now(ctx.io, .real).toMilliseconds();
+    const st = state_mod.loadState(ctx) catch return .{ .ready = false, .message = "state unreadable" };
+    const coverage = poll.decisiveCoverage(cfg, st, now_ms, .{
+        .required_source_ids = load_opts.required_source_ids,
+        .minimum_decisive_sources = load_opts.minimum_decisive_sources,
+        .fast_interval_override = load_opts.fast_interval_override,
+    });
+    if (!coverage.required_fresh) return .{ .ready = false, .message = "required decisive source stale" };
+    if (!coverage.healthy) return .{ .ready = false, .message = "insufficient fresh decisive coverage" };
+    if (!diskSpaceReady(diskFreeBytes(ctx.arena, ctx.state_path) catch null) or
+        !diskSpaceReady(diskFreeBytes(ctx.arena, ctx.log_path) catch null))
+        return .{ .ready = false, .message = "insufficient disk space" };
+    for (st.deliveries) |delivery| {
+        if (!delivery.delivered and delivery.next_retry_ms <= now_ms and delivery.lease_until_ms <= now_ms)
+            return .{ .ready = false, .message = "delivery backlog overdue" };
+    }
+    return .{ .ready = true, .message = "ready" };
+}
+
+fn diskSpaceReady(free: ?u64) bool {
+    return (free orelse return false) >= 10 * 1024 * 1024;
+}
+
+fn diskFreeBytes(arena: Allocator, path: []const u8) !?u64 {
+    const c = @cImport(@cInclude("sys/statvfs.h"));
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const dir_z = try arena.dupeZ(u8, dir);
+    var stat: c.struct_statvfs = undefined;
+    if (c.statvfs(dir_z.ptr, &stat) != 0) return null;
+    return try std.math.mul(u64, @intCast(stat.f_bavail), @intCast(stat.f_frsize));
 }
 
 // --- fragment renderers -----------------------------------------------------
@@ -124,7 +201,7 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]
     const a = ctx.arena;
     const rows = cache.events(ctx);
     const st = cache.state(ctx);
-    const cfg = config.load(ctx, load_opts);
+    const cfg = try config.loadChecked(ctx, load_opts);
 
     var last_obs: []const u8 = "—";
     var max_ms: i64 = 0;
@@ -147,6 +224,10 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]
     try card(a, &out, "Sources", try std.fmt.allocPrint(a, "{d}", .{cfg.sources.len}), "text-sky-400");
     try card(a, &out, "Events logged", try std.fmt.allocPrint(a, "{d}", .{cache.events_total}), "text-sky-400");
     try card(a, &out, "Active alerts", try std.fmt.allocPrint(a, "{d}", .{active_alerts}), alert_accent);
+    const pending = st.pendingDeliveries();
+    try card(a, &out, "Pending delivery", try std.fmt.allocPrint(a, "{d}", .{pending}), if (pending > 0) "text-rose-400" else "text-emerald-400");
+    const failed = failedDeliveries(st);
+    try card(a, &out, "Failed delivery", try std.fmt.allocPrint(a, "{d}", .{failed}), if (failed > 0) "text-rose-400" else "text-emerald-400");
     try card(a, &out, "Last observed", esc(a, last_obs), "text-slate-200");
     try out.appendSlice(a, "</div>");
     return out.items;
@@ -154,7 +235,7 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]
 
 fn renderSources(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]const u8 {
     const a = ctx.arena;
-    const cfg = config.load(ctx, load_opts);
+    const cfg = try config.loadChecked(ctx, load_opts);
     const st = cache.state(ctx);
 
     var out: std.ArrayList(u8) = .empty;
@@ -239,7 +320,7 @@ fn renderAlerts(ctx: *Context, cache: *Cache) ![]const u8 {
 // --- search index -----------------------------------------------------------
 
 /// The search corpus: every observation event plus every alert, emitted as a
-/// flat JSON array the browser indexes with Orama. Rendered from the same arena
+/// flat JSON array the browser searches locally. Rendered from the same arena
 /// as the fragments, so it is reclaimed when the connection closes.
 fn renderSearchIndex(ctx: *Context, cache: *Cache) ![]const u8 {
     const a = ctx.arena;
@@ -320,7 +401,7 @@ fn jsonStr(a: Allocator, s: []const u8) []const u8 {
 
 // --- parsed-data cache --------------------------------------------------------
 
-/// Parsed dashboard data cached across requests, keyed by file mtime. The htmx
+/// Parsed dashboard data cached across requests, keyed by file mtime. Browser
 /// fragments poll every few seconds; without this every poll would spawn zstd
 /// and re-parse the full history. The cache owns its memory via dedicated
 /// arenas (one per file, reset only when that file's mtime moves), so slices it
@@ -360,12 +441,11 @@ const Cache = struct {
     /// The observation log, parsed and sorted ascending by time. Re-reads only
     /// when the log file's mtime changed since the cached parse.
     fn events(self: *Cache, ctx: *Context) []Event {
-        const mt = fileMtime(ctx.io, ctx.log_path);
+        const mt = @import("events.zig").logStamp(ctx.io, ctx.arena, ctx.log_path);
         if (self.cachedEventsFor(mt)) |cached| return cached;
         // Scratch (compressed + decompressed bytes) goes in the request arena;
         // `refreshEvents` copies what the cache keeps into its own arena.
-        const raw = Io.Dir.cwd().readFileAlloc(ctx.io, ctx.log_path, ctx.arena, .limited(256 * 1024 * 1024)) catch return &.{};
-        const data = zstd.decompress(ctx.io, ctx.arena, raw) catch return &.{};
+        const data = @import("events.zig").readLog(ctx.io, ctx.arena, ctx.log_path) catch return &.{};
         return self.refreshEvents(mt, data);
     }
 
@@ -514,7 +594,8 @@ fn detailCell(a: Allocator, text: []const u8, url: []const u8) []const u8 {
         return std.fmt.allocPrint(a, "{s} <span class=\"text-slate-500 text-xs\">{s}</span>", .{ text, esc(a, url) }) catch text;
     }
     const u = esc(a, url);
-    return std.fmt.allocPrint(a,
+    return std.fmt.allocPrint(
+        a,
         "<a href=\"{s}\" data-reader-url=\"{s}\" data-reader-label=\"{s}\" class=\"reader-link text-sky-400 hover:underline\">{s}</a>" ++
             " <a href=\"{s}\" target=\"_blank\" rel=\"noreferrer\" class=\"reader-ext text-slate-500\" title=\"open externally\">↗</a>",
         .{ u, u, text, text, u },
@@ -566,6 +647,32 @@ fn errFrag(a: Allocator) []const u8 {
     return "<p class=\"text-rose-400\">render error — check the server log</p>";
 }
 
+const FragmentResponse = struct {
+    body: []const u8,
+    status: http.Status = .ok,
+};
+
+/// Config-backed endpoints remain recoverable when an external file changes
+/// after server startup. The next successful request reloads it normally.
+fn configFragment(rendered: anyerror![]const u8) FragmentResponse {
+    const body = rendered catch |err| {
+        log("serve: configuration reload failed: {s}", .{@errorName(err)});
+        return .{
+            .body = "<p class=\"text-rose-400\">configuration unavailable — check the server log</p>",
+            .status = .service_unavailable,
+        };
+    };
+    return .{ .body = body };
+}
+
+fn failedDeliveries(st: state_mod.State) usize {
+    var count: usize = 0;
+    for (st.deliveries) |delivery| {
+        if (!delivery.delivered and delivery.last_error.len > 0) count += 1;
+    }
+    return count;
+}
+
 /// Path portion of a request target, query string stripped.
 fn pathOf(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '?')) |q| return target[0..q];
@@ -602,6 +709,11 @@ fn eql(a: []const u8, b: []const u8) bool {
 // arena) and are evicted oldest-first once the table is full.
 const reader_cache_cap = 48;
 const reader_cache_ttl_ms: i64 = 15 * 60 * 1000;
+const reader_worker_cap = 2;
+
+/// The server intentionally binds loopback only. Any reverse proxy that makes
+/// it remotely reachable MUST enforce authentication and TLS before forwarding.
+pub const proxy_auth_requirement = "Remote proxy exposure requires authenticated TLS access; the dashboard does not implement application authentication.";
 
 const ReaderEntry = struct {
     url: []u8,
@@ -610,17 +722,24 @@ const ReaderEntry = struct {
 };
 
 var reader_cache_entries: [reader_cache_cap]?ReaderEntry = [_]?ReaderEntry{null} ** reader_cache_cap;
+var reader_inflight: [reader_worker_cap]?[]u8 = [_]?[]u8{null} ** reader_worker_cap;
+var reader_mutex: Io.Mutex = .init;
 
-fn readerCacheGet(url: []const u8, now_ms: i64) ?[]const u8 {
+fn readerCacheGet(io: Io, a: Allocator, url: []const u8, now_ms: i64) ?[]const u8 {
+    reader_mutex.lockUncancelable(io);
+    defer reader_mutex.unlock(io);
     for (&reader_cache_entries) |*slot| {
         if (slot.*) |e| {
-            if (std.mem.eql(u8, e.url, url) and now_ms - e.ts_ms < reader_cache_ttl_ms) return e.html;
+            if (std.mem.eql(u8, e.url, url) and now_ms - e.ts_ms < reader_cache_ttl_ms)
+                return a.dupe(u8, e.html) catch null;
         }
     }
     return null;
 }
 
-fn readerCachePut(url: []const u8, html: []const u8, now_ms: i64) void {
+fn readerCachePut(io: Io, url: []const u8, html: []const u8, now_ms: i64) void {
+    reader_mutex.lockUncancelable(io);
+    defer reader_mutex.unlock(io);
     const ga = std.heap.page_allocator;
     var target: usize = 0;
     var chosen = false;
@@ -669,33 +788,169 @@ fn readerCachePut(url: []const u8, html: []const u8, now_ms: i64) void {
     reader_cache_entries[target] = .{ .url = url_copy, .html = html_copy, .ts_ms = now_ms };
 }
 
-fn renderReader(ctx: *Context, cache: *Cache, target: []const u8) ![]const u8 {
+fn renderReader(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, target: []const u8) ![]const u8 {
     const a = ctx.arena;
+    if (!readerEnabled()) return readerError(a, "reader disabled. set FABLE_MONITOR_READER=1 to enable on-demand article fetching.");
     const raw = queryRaw(target, "url") orelse return readerError(a, "no url provided");
     const url = percentDecode(a, raw);
-    const is_http = std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://");
-    if (!is_http) return readerError(a, "unsupported url scheme");
+    if (!readerUrlSafe(url)) return readerError(a, "reader only permits public HTTPS URLs on recorded source hosts");
     const now_ms = Io.Timestamp.now(ctx.io, .real).toMilliseconds();
-    // A cached entry was allowlisted when stored, so serve it before paying the
-    // allowlist's event-log decompression cost.
-    if (readerCacheGet(url, now_ms)) |cached| return cached;
-    if (!urlAllowed(ctx, cache, url)) return readerError(a, "this url is not in the monitor's records");
-    // Browser UA: several sources (federalregister.gov, ecfr.gov) serve a
-    // "Request Access" CAPTCHA wall to a non-browser UA. This on-demand,
-    // user-initiated fetch presents a browser identity to get the real article.
-    const html = fetch.httpGetBrowser(ctx, url) catch
-        return readerError(a, "could not load this source. it may block embedding — use the external link (top-right) to open it in a new tab.");
-    // If the source still returned a bot-block / CAPTCHA page, don't render the
-    // broken wall inside the drawer — show a clean message pointing at the ↗.
-    if (looksBlocked(html))
-        return readerError(a, "this source is blocking automated access (a CAPTCHA / \"request access\" wall). use the external link (top-right) to open it in a new tab.");
-    // Strip client-side scripts: we want the server-rendered article, not a
-    // hydration that fails cross-origin (SPA pages otherwise show their own
-    // "couldn't load" boundary). CSS/images still resolve via the injected base.
-    const stripped = stripScripts(a, html) catch html;
-    const doc = try injectBase(a, stripped, url);
-    readerCachePut(url, doc, now_ms);
-    return doc;
+    if (!urlAllowed(ctx, cache, url) or !(try hostAllowed(ctx, load_opts, cache, url)))
+        return readerError(a, "this url or host is not in the monitor's public records");
+    if (readerCacheGet(ctx.io, a, url, now_ms)) |cached| return cached;
+    return switch (startReader(ctx.io, url)) {
+        .started, .inflight => readerPending(a, target),
+        .busy => readerError(a, "reader capacity is busy. retry shortly or use the external link."),
+        .failed => readerError(a, "reader worker could not be started. use the external link."),
+    };
+}
+
+const ReaderStart = enum { started, inflight, busy, failed };
+
+fn startReader(io: Io, url: []const u8) ReaderStart {
+    reader_mutex.lockUncancelable(io);
+    defer reader_mutex.unlock(io);
+    var free_slot: ?usize = null;
+    for (reader_inflight, 0..) |entry, i| {
+        if (entry) |active| {
+            if (std.mem.eql(u8, active, url)) return .inflight;
+        } else if (free_slot == null) free_slot = i;
+    }
+    const slot = free_slot orelse return .busy;
+    const owned_url = std.heap.page_allocator.dupe(u8, url) catch return .failed;
+    reader_inflight[slot] = owned_url;
+    const thread = std.Thread.spawn(.{}, readerWorker, .{ io, owned_url }) catch {
+        reader_inflight[slot] = null;
+        std.heap.page_allocator.free(owned_url);
+        return .failed;
+    };
+    thread.detach();
+    return .started;
+}
+
+fn readerWorker(io: Io, url: []u8) void {
+    defer {
+        reader_mutex.lockUncancelable(io);
+        for (&reader_inflight) |*entry| if (entry.*) |active| {
+            if (active.ptr == url.ptr) {
+                entry.* = null;
+                break;
+            }
+        };
+        reader_mutex.unlock(io);
+        std.heap.page_allocator.free(url);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var worker_ctx = Context{
+        .io = io,
+        .arena = a,
+        .state_path = "",
+        .log_path = "",
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    const doc = readerWorkerDocument(&worker_ctx, url);
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    readerCachePut(io, url, doc, now_ms);
+}
+
+fn readerWorkerDocument(ctx: *Context, url: []const u8) []const u8 {
+    const a = ctx.arena;
+    const response = fetch.httpGetBrowser(ctx, url) catch |err| switch (err) {
+        error.RedirectUnsupported => return readerError(a, "this source redirects to another URL. redirects are not supported by the secure reader; use the external link to open it."),
+        error.PrivateAddress => return readerError(a, "reader DNS resolution included a non-public address and was blocked."),
+        error.InvalidContentType => return readerError(a, "reader refused a non-HTML response."),
+        else => return readerError(a, "could not load this source. it may block embedding; use the external link."),
+    };
+    if (looksBlocked(response.body))
+        return readerError(a, "this source is blocking automated access. use the external link to open it.");
+    const stripped = stripScripts(a, response.body) catch response.body;
+    return injectBase(a, stripped, url) catch readerError(a, "reader could not process this page; use the external link.");
+}
+
+fn readerPending(a: Allocator, target: []const u8) []const u8 {
+    return std.fmt.allocPrint(
+        a,
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"1;url={s}\"></head>" ++
+            "<body style=\"margin:0;height:100vh;background:#000;color:#fff;display:grid;place-items:center;font:13px monospace\">loading secure reader...</body></html>",
+        .{esc(a, target)},
+    ) catch readerError(a, "reader is loading; retry shortly.");
+}
+
+fn readerEnabled() bool {
+    const value = std.c.getenv("FABLE_MONITOR_READER") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+/// Syntactic SSRF gate for the reader's initial URL. The fetch layer separately
+/// enforces HTTPS and refuses redirects, so it cannot make an unchecked hop.
+fn readerUrlSafe(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+    if (uri.user != null or uri.password != null) return false;
+    if (uri.port != null and uri.port.? != 443) return false;
+    const component = uri.host orelse return false;
+    const host = switch (component) {
+        .raw => |raw| raw,
+        .percent_encoded => |encoded| if (std.mem.indexOfScalar(u8, encoded, '%') == null) encoded else return false,
+    };
+    return publicHost(host);
+}
+
+fn publicHost(host_raw: []const u8) bool {
+    const unbracketed = std.mem.trim(u8, host_raw, "[]");
+    if (unbracketed.len == 0 or unbracketed[unbracketed.len - 1] == '.') return false;
+    const host = unbracketed;
+    if (host.len == 0 or std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.endsWithIgnoreCase(host, ".localhost") or
+        std.ascii.endsWithIgnoreCase(host, ".local") or
+        std.ascii.endsWithIgnoreCase(host, ".internal") or
+        std.ascii.eqlIgnoreCase(host, "metadata.google.internal")) return false;
+
+    if (net.IpAddress.parse(host, 0)) |ip| return publicIp(ip) else |_| {}
+    // Reject numeric-looking alternate IPv4 forms that strict parsing does not
+    // recognize (integer, octal, shortened, or hex forms).
+    var numeric = true;
+    for (host) |c| if (!(std.ascii.isDigit(c) or c == '.' or c == 'x' or c == 'X')) {
+        numeric = false;
+        break;
+    };
+    if (numeric or std.ascii.startsWithIgnoreCase(host, "0x")) return false;
+    net.HostName.validate(host) catch return false;
+    return true;
+}
+
+fn publicIp(ip: net.IpAddress) bool {
+    return fetch.publicIp(ip);
+}
+
+fn hostAllowed(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, url: []const u8) !bool {
+    const wanted = urlHost(url) orelse return false;
+    const cfg = try config.loadChecked(ctx, load_opts);
+    for (cfg.sources) |source| if (readerUrlSafe(source.url) and sameUrlHost(wanted, source.url)) return true;
+    for (cache.events(ctx)) |event| if (sameUrlHost(wanted, event.url) and readerUrlSafe(event.url)) return true;
+    for (cache.state(ctx).alerts) |alert| if (sameUrlHost(wanted, alert.url) and readerUrlSafe(alert.url)) return true;
+    return false;
+}
+
+fn urlHost(url: []const u8) ?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    const component = uri.host orelse return null;
+    return switch (component) {
+        .raw => |raw| raw,
+        .percent_encoded => |encoded| if (std.mem.indexOfScalar(u8, encoded, '%') == null) encoded else null,
+    };
+}
+
+fn sameUrlHost(wanted: []const u8, candidate_url: []const u8) bool {
+    const candidate = urlHost(candidate_url) orelse return false;
+    const a = std.mem.trimEnd(u8, std.mem.trim(u8, wanted, "[]"), ".");
+    const b = std.mem.trimEnd(u8, std.mem.trim(u8, candidate, "[]"), ".");
+    return std.ascii.eqlIgnoreCase(a, b);
 }
 
 /// Heuristic: does this page look like a bot-block / CAPTCHA interstitial rather
@@ -764,7 +1019,8 @@ fn injectBase(a: Allocator, html: []const u8, url: []const u8) ![]const u8 {
 
 /// A minimal, on-theme HTML page shown inside the reader iframe on any failure.
 fn readerError(a: Allocator, msg: []const u8) []const u8 {
-    return std.fmt.allocPrint(a,
+    return std.fmt.allocPrint(
+        a,
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;height:100%;background:#000;color:#fff;" ++
             "font-family:'Roboto Mono',ui-monospace,monospace;display:flex;align-items:center;justify-content:center;}}" ++
             "p{{padding:24px;font-size:13px;letter-spacing:.02em;color:#e8e8e8;text-align:center;max-width:520px;line-height:1.7;}}" ++
@@ -816,8 +1072,8 @@ fn hexVal(c: u8) ?u8 {
 }
 
 // --- static page shell ------------------------------------------------------
-// Tailwind v4 (browser build) + htmx, both from a CDN so there is no build step.
-// htmx polls the /ui/* fragment endpoints and swaps their HTML in place.
+// All executable and style assets are served from immutable bytes embedded in
+// this binary. There is no runtime CDN dependency.
 
 const shell =
     \\<!doctype html>
@@ -826,13 +1082,8 @@ const shell =
     \\<meta charset="utf-8">
     \\<meta name="viewport" content="width=device-width, initial-scale=1">
     \\<title>fable-monitor</title>
-    \\<link rel="preconnect" href="https://fonts.googleapis.com">
-    \\<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    \\<link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
-    \\<link href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.31.0/dist/tabler-icons.min.css" rel="stylesheet">
-    \\<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    \\<script src="https://unpkg.com/htmx.org@2.0.3"></script>
-    \\<style type="text/tailwindcss">
+    \\<link href="/static/app.css" rel="stylesheet">
+    \\<style>
     \\@theme {
     \\  --font-sans: "Roboto Mono", ui-monospace, monospace;
     \\  --font-mono: "Roboto Mono", ui-monospace, monospace;
@@ -1085,83 +1336,7 @@ const shell =
     \\})();
     \\</script>
     \\
-    \\<script type="module">
-    \\import { create, insertMultiple, search } from 'https://esm.sh/@orama/orama@3';
-    \\(async function(){
-    \\  var input=document.getElementById('cc-search');
-    \\  var results=document.getElementById('cc-results');
-    \\  var meta=document.getElementById('cc-search-meta');
-    \\  if(!input) return;
-    \\  var db=null, count=0, loadedAt=0, building=null;
-    \\  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-    \\  function rx(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
-    \\  function tierBadge(t){var n=(t>=1&&t<=3)?t:0;return '<span class="cc-tier '+(n?'t'+n:'')+'">'+(n?'T'+n:'—')+'</span>';}
-    \\  function highlight(title,term){
-    \\    var out=esc(title);
-    \\    var toks=term.split(/\s+/).filter(function(w){return w.length>=2;});
-    \\    toks.forEach(function(w){
-    \\      try{out=out.replace(new RegExp('('+rx(esc(w))+')','ig'),'<span class="cc-hit">$1</span>');}catch(e){}
-    \\    });
-    \\    return out;
-    \\  }
-    \\  async function build(){
-    \\    if(building) return building;
-    \\    building=(async function(){
-    \\      try{
-    \\        var res=await fetch('/ui/search-index',{headers:{'accept':'application/json'}});
-    \\        var docs=await res.json();
-    \\        docs.forEach(function(x,i){x.id=String(i);});
-    \\        var d=create({schema:{title:'string',source:'string',kind:'string',detail:'string',event:'string',tier:'number',url:'string',when:'string',ts:'number'}});
-    \\        await insertMultiple(d,docs);
-    \\        db=d; count=docs.length; loadedAt=Date.now();
-    \\        if(!input.value.trim()) meta.textContent=count+' indexed';
-    \\      }catch(err){ meta.textContent='index unavailable'; }
-    \\      building=null;
-    \\    })();
-    \\    return building;
-    \\  }
-    \\  function render(r,term){
-    \\    results.hidden=false;
-    \\    if(!r.hits.length){
-    \\      results.innerHTML='<div class="cc-res-empty">no matches for &ldquo;'+esc(term)+'&rdquo;</div>';
-    \\      meta.textContent='0 results'; return;
-    \\    }
-    \\    meta.textContent=r.count+' result'+(r.count===1?'':'s');
-    \\    results.innerHTML=r.hits.map(function(h){
-    \\      var doc=h.document;
-    \\      var isHttp=/^https?:\/\//i.test(doc.url||'');
-    \\      var attrs=isHttp?(' data-reader-url="'+esc(doc.url)+'" data-reader-label="'+esc(doc.title)+'"'):'';
-    \\      return '<div class="cc-res-row"'+attrs+'>'+
-    \\        tierBadge(doc.tier)+
-    \\        '<span class="cc-res-src">'+esc(doc.source||'')+'</span>'+
-    \\        '<span class="cc-res-title">'+highlight(doc.title||'(untitled)',term)+'</span>'+
-    \\        '<span class="cc-res-when">'+esc(doc.when||'')+'</span>'+
-    \\      '</div>';
-    \\    }).join('');
-    \\  }
-    \\  async function run(){
-    \\    var term=input.value.trim();
-    \\    if(!term){ results.hidden=true; results.innerHTML=''; if(db) meta.textContent=count+' indexed'; return; }
-    \\    if(!db){ await build(); }
-    \\    if(!db){ return; }
-    \\    try{
-    \\      var r=await search(db,{term:term,properties:['title','source','detail','kind','event'],limit:40,tolerance:1,boost:{title:2,source:1.2}});
-    \\      render(r,term);
-    \\    }catch(e){ meta.textContent='search error'; }
-    \\  }
-    \\  var t=null;
-    \\  input.addEventListener('input',function(){clearTimeout(t);t=setTimeout(run,140);});
-    \\  input.addEventListener('focus',function(){ if(!db||Date.now()-loadedAt>60000) build(); });
-    \\  document.addEventListener('keydown',function(e){
-    \\    var tag=(document.activeElement&&document.activeElement.tagName||'').toLowerCase();
-    \\    if(e.key==='/'&&tag!=='input'&&tag!=='textarea'){ e.preventDefault(); input.focus(); input.select(); return; }
-    \\    if(e.key==='Escape'&&document.activeElement===input){
-    \\      if(input.value){ input.value=''; run(); } else { input.blur(); }
-    \\    }
-    \\  });
-    \\  build();
-    \\})();
-    \\</script>
+    \\<script src="/static/app.js" defer></script>
     \\</body>
     \\</html>
 ;
@@ -1197,6 +1372,177 @@ test "detailCell allowlists http/https and renders other schemes as text" {
 
     // No URL: text passes through untouched.
     try std.testing.expectEqualStrings("t", detailCell(a, "t", ""));
+}
+
+test "reader URL gate requires public HTTPS without credentials or unusual ports" {
+    try std.testing.expect(readerUrlSafe("https://example.com/article"));
+    try std.testing.expect(readerUrlSafe("https://8.8.8.8/article"));
+    try std.testing.expect(!readerUrlSafe("http://example.com/article"));
+    try std.testing.expect(!readerUrlSafe("https://user:pass@example.com/article"));
+    try std.testing.expect(!readerUrlSafe("https://example.com:8443/article"));
+    try std.testing.expect(!readerUrlSafe("https://localhost/article"));
+    try std.testing.expect(!readerUrlSafe("https://localhost./article"));
+    try std.testing.expect(!readerUrlSafe("https://metadata.google.internal/computeMetadata/v1/"));
+}
+
+test "reader URL gate rejects private, link-local, and alternate numeric hosts" {
+    for ([_][]const u8{
+        "https://0.0.0.0/",
+        "https://127.0.0.1/",
+        "https://10.0.0.1/",
+        "https://100.64.0.1/",
+        "https://172.16.0.1/",
+        "https://192.168.1.1/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://224.0.0.1/",
+        "https://255.255.255.255/",
+        "https://[::1]/",
+        "https://[::ffff:127.0.0.1]/",
+        "https://[64:ff9b::127.0.0.1]/",
+        "https://[fe80::1]/",
+        "https://[fc00::1]/",
+        "https://[ff02::1]/",
+        "https://2130706433/",
+        "https://0177.0.0.1/",
+        "https://127.1/",
+        "https://0x7f000001/",
+        "https://0x7f.0.0.1/",
+        "https://%31%32%37.0.0.1/",
+        "https://[fe80::1%25lo0]/",
+        "https://example_com/",
+        "https://example.com%00.evil/",
+        "https://example.com./",
+    }) |url| try std.testing.expect(!readerUrlSafe(url));
+}
+
+test "reader work admission is bounded and nonblocking when saturated" {
+    var one = [_]u8{'a'};
+    var two = [_]u8{'b'};
+    reader_inflight[0] = one[0..];
+    reader_inflight[1] = two[0..];
+    defer reader_inflight = [_]?[]u8{null} ** reader_worker_cap;
+
+    try std.testing.expectEqual(ReaderStart.busy, startReader(std.testing.io, "https://example.com/article"));
+}
+
+test "readiness disk threshold fails closed" {
+    try std.testing.expect(!diskSpaceReady(null));
+    try std.testing.expect(!diskSpaceReady(10 * 1024 * 1024 - 1));
+    try std.testing.expect(diskSpaceReady(10 * 1024 * 1024));
+}
+
+test "readyz is non-200 for unreadable, stale, insufficient, and overdue-delivery states" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    // A real on-disk state path so loadState/saveState and the disk-free probe
+    // (which stats the parent directory) all resolve against the repo cwd.
+    const state_path = ".test-fable-monitor-readyz-state.jsonl.zst";
+    defer Io.Dir.cwd().deleteFile(io, state_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, state_path ++ ".backup") catch {};
+
+    var ctx = Context{
+        .io = io,
+        .arena = a,
+        .state_path = state_path,
+        .log_path = state_path, // readiness probes disk on both; one file suffices
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    // Embedded default config: the tier-1 decisive sources drive coverage.
+    const load_opts = config.LoadOptions{ .required_source_ids = &.{"anthropic_model_list"} };
+    const decisive_id = "anthropic_model_list";
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    // Default fast interval is 45s; freshness expires at 2x. Well inside/outside.
+    const fresh_ms = now_ms - 1000;
+    const stale_ms = now_ms - 10 * 60 * 1000;
+
+    // 1. Unreadable state: a corrupt (non-zstd) active generation fails closed.
+    {
+        var f = try Io.Dir.cwd().createFile(io, state_path, .{});
+        try f.writeStreamingAll(io, "not zstd, not ndjson");
+        f.close(io);
+        const ready = readiness(&ctx, load_opts);
+        try std.testing.expect(!ready.ready);
+        try std.testing.expectEqualStrings("state unreadable", ready.message);
+    }
+
+    // saveState refuses to overwrite an unvalidatable generation (fail-closed),
+    // so clear the corrupt bytes from case 1 before writing clean generations.
+    try Io.Dir.cwd().deleteFile(io, state_path);
+
+    // 2. Required decisive source stale: last success older than the window.
+    {
+        var statuses = [_]state_mod.State.SourceStatus{
+            .{ .id = decisive_id, .last_poll_ms = now_ms, .last_success_ms = stale_ms },
+        };
+        try state_mod.saveState(&ctx, .{ .source_status = &statuses });
+        const ready = readiness(&ctx, load_opts);
+        try std.testing.expect(!ready.ready);
+        try std.testing.expectEqualStrings("required decisive source stale", ready.message);
+    }
+
+    // 3. Insufficient coverage: nothing fresh, but the required id is absent so
+    //    the stale-required branch does not mask the coverage-count branch.
+    {
+        var statuses = [_]state_mod.State.SourceStatus{
+            .{ .id = "anthropic_pricing", .last_poll_ms = now_ms, .last_success_ms = stale_ms },
+        };
+        try state_mod.saveState(&ctx, .{ .source_status = &statuses });
+        const ready = readiness(&ctx, .{ .minimum_decisive_sources = 1 });
+        try std.testing.expect(!ready.ready);
+        try std.testing.expectEqualStrings("insufficient fresh decisive coverage", ready.message);
+    }
+
+    // 4. Overdue pending delivery: coverage is healthy, but an undelivered
+    //    record whose retry and lease are both due keeps the service not-ready.
+    {
+        var statuses = [_]state_mod.State.SourceStatus{
+            .{ .id = decisive_id, .last_poll_ms = now_ms, .last_success_ms = fresh_ms },
+        };
+        // A pending, unleased delivery whose retry time is already in the past:
+        // undelivered with next_retry_ms and lease_until_ms both <= now is the
+        // overdue-backlog condition readiness fails on. The payload must embed
+        // the occurrence idempotency key to pass state validation.
+        var deliveries = [_]state_mod.State.DeliveryRecord{
+            .{
+                .occurrence_id = "occ-overdue",
+                .event_identity = "one",
+                .sink = "webhook",
+                .payload =
+                \\{"event_id":"one","occurrence_id":"occ-overdue","idempotency_key":"occ-overdue"}
+                ,
+                .next_retry_ms = fresh_ms,
+                .lease_until_ms = 0,
+                .lease_token = "",
+            },
+        };
+        try state_mod.saveState(&ctx, .{ .source_status = &statuses, .deliveries = &deliveries });
+        const ready = readiness(&ctx, load_opts);
+        try std.testing.expect(!ready.ready);
+        try std.testing.expectEqualStrings("delivery backlog overdue", ready.message);
+    }
+
+    // 5. Healthy: fresh required coverage and no overdue delivery is 200/ready.
+    {
+        var statuses = [_]state_mod.State.SourceStatus{
+            .{ .id = decisive_id, .last_poll_ms = now_ms, .last_success_ms = fresh_ms },
+        };
+        try state_mod.saveState(&ctx, .{ .source_status = &statuses });
+        const ready = readiness(&ctx, load_opts);
+        try std.testing.expect(ready.ready);
+        try std.testing.expectEqualStrings("ready", ready.message);
+    }
+}
+
+test "shell has no remote executable or stylesheet dependencies" {
+    try std.testing.expect(std.mem.indexOf(u8, shell, "<script src=\"http") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "<link href=\"http") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "esm.sh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "/static/app.js") != null);
 }
 
 test "parseEventLog parses, sorts ascending, and copies strings out of the input" {
@@ -1281,4 +1627,65 @@ test "Cache re-parses events only when the mtime moves" {
     try std.testing.expectEqual(@as(usize, 2), second.len);
     try std.testing.expectEqual(@as(usize, 2), cache.cachedEventsFor(101).?.len);
     try std.testing.expect(cache.cachedEventsFor(100) == null);
+}
+
+test "malformed runtime config returns unavailable responses without exiting" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = ".test-fable-monitor-serve-invalid-config.json";
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var file = try Io.Dir.cwd().createFile(std.testing.io, path, .{});
+    file.close(std.testing.io);
+
+    var ctx = Context{
+        .io = std.testing.io,
+        .arena = a,
+        .state_path = "",
+        .log_path = "",
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const opts = config.LoadOptions{ .sources_path = path };
+
+    const fragment = configFragment(renderSources(&ctx, opts, &cache));
+    try std.testing.expectEqual(http.Status.service_unavailable, fragment.status);
+    try std.testing.expect(std.mem.indexOf(u8, fragment.body, "configuration unavailable") != null);
+
+    const ready = readiness(&ctx, opts);
+    try std.testing.expect(!ready.ready);
+    try std.testing.expectEqualStrings("configuration unavailable", ready.message);
+}
+
+test "status distinguishes failed deliveries from the pending total" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ctx = Context{
+        .io = std.testing.io,
+        .arena = arena_state.allocator(),
+        .state_path = "",
+        .log_path = "",
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    var deliveries = [_]state_mod.State.DeliveryRecord{
+        .{ .occurrence_id = "fresh", .event_identity = "one", .sink = "webhook", .payload = "{}" },
+        .{ .occurrence_id = "failed", .event_identity = "two", .sink = "notify", .payload = "{}", .attempts = 1, .last_error = "NotifyFailed" },
+        .{ .occurrence_id = "done", .event_identity = "three", .sink = "stdout", .payload = "{}", .attempts = 1, .last_error = "old", .delivered = true },
+    };
+    const st = state_mod.State{ .deliveries = &deliveries };
+    try std.testing.expectEqual(@as(usize, 2), st.pendingDeliveries());
+    try std.testing.expectEqual(@as(usize, 1), failedDeliveries(st));
+
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.state_mtime = Cache.mtime_missing;
+    cache.state_val = st;
+    const html = try renderStatus(&ctx, .{}, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Pending delivery") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Failed delivery") != null);
 }

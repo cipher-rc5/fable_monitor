@@ -26,12 +26,15 @@ fn tmpName(io: Io, arena: Allocator) ![]u8 {
 /// input is staged in a per-invocation temp file — which also sidesteps any
 /// pipe-buffer deadlock, since zstd reads a file while we drain its stdout.
 /// The file is removed afterward.
-fn zstdFilter(io: Io, arena: Allocator, flags: []const []const u8, input: []const u8) ![]u8 {
+fn zstdFilter(io: Io, arena: Allocator, flags: []const []const u8, input: []const u8, allow_partial: bool) ![]u8 {
     const zstd_tmp = try tmpName(io, arena);
     const dir = Io.Dir.cwd();
     {
-        var f = try dir.createFile(io, zstd_tmp, .{});
+        var f = try dir.createFile(io, zstd_tmp, .{
+            .permissions = .fromMode(0o600),
+        });
         defer f.close(io);
+        try f.setPermissions(io, .fromMode(0o600));
         try f.writeStreamingAll(io, input);
     }
     defer dir.deleteFile(io, zstd_tmp) catch {};
@@ -48,6 +51,7 @@ fn zstdFilter(io: Io, arena: Allocator, flags: []const []const u8, input: []cons
     });
     switch (result.term) {
         .exited => |code| if (code != 0) {
+            if (allow_partial and result.stdout.len > 0) return result.stdout;
             log("zstd exit {d}: {s}", .{ code, std.mem.trim(u8, result.stderr, " \n\r") });
             return error.ZstdFailed;
         },
@@ -58,12 +62,18 @@ fn zstdFilter(io: Io, arena: Allocator, flags: []const []const u8, input: []cons
 
 /// Compress `data` with the system `zstd` binary.
 pub fn compress(io: Io, arena: Allocator, data: []const u8) ![]u8 {
-    return zstdFilter(io, arena, &.{ "-q", "-c" }, data);
+    return zstdFilter(io, arena, &.{ "-q", "-c" }, data, false);
 }
 
 /// Decompress `data` with the system `zstd` binary.
 pub fn decompress(io: Io, arena: Allocator, data: []const u8) ![]u8 {
-    return zstdFilter(io, arena, &.{ "-q", "-d", "-c" }, data);
+    return zstdFilter(io, arena, &.{ "-q", "-d", "-c" }, data, false);
+}
+
+/// Decode every complete frame preceding a torn trailing frame. This is only
+/// for recovery of logs written by the former direct-append format.
+pub fn decompressRecover(io: Io, arena: Allocator, data: []const u8) ![]u8 {
+    return zstdFilter(io, arena, &.{ "-q", "-d", "-c" }, data, true);
 }
 
 /// Backing context for the `parquet.Compressor` thunk: the bits `compress`
