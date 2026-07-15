@@ -1,6 +1,6 @@
 # Design decisions
 
-Last reviewed: 2026-06-18 · against fable-monitor 0.1.0
+Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
 
 This file records *why* the tool is built the way it is, in lightweight ADR
 (Architecture Decision Record) form. Each entry states the decision, the
@@ -161,13 +161,12 @@ time. JSONL is self-describing, `std.json`-serialized, and (decompressed)
 inspectable with `jq`/`grep`. Sharing one timestamp per run keeps events from a
 poll grouped. See [data-export.md](data-export.md).
 
-**Trade-off.** Because the log is a single zstd stream, "append" is really a
-read-modify-write: each run decompresses the existing log, adds its lines, and
-recompresses. That is more work than the original open-and-append-at-the-end
-approach, but the log grows with *events*, not poll frequency, a slow-moving
-regulatory signal produces few rows, so the rewrite stays cheap. The log has no
-automatic cap; rotation is left to the operator. We log events, not every poll,
-so the file is not an uptime record.
+**Trade-off.** Each run atomically commits an immutable zstd frame under a lock;
+a small manifest selects the compacted base generation and active segments.
+Append latency is independent of retained history. Automatic compaction retains
+the configured newest N records, and `log compact` exposes immediate
+maintenance. The base, manifest, and segment directory must be backed up as one
+logical log. We log events, not every poll, so it is not an uptime record.
 
 ---
 

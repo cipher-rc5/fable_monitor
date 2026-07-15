@@ -1,6 +1,6 @@
 # Development
 
-Last reviewed: 2026-06-18 · against fable-monitor 0.1.0 (reviewed after the src/ modularization)
+Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
 
 How to build, test, and contribute to `fable-monitor`, plus the policy that
 keeps this documentation current.
@@ -56,15 +56,20 @@ sync automatically.
 
 ## Tests
 
-Unit tests live next to the code they cover. `src/html.zig` covers the pure text
+Unit tests live next to the code they cover. The current suite has **147 tests**.
+`src/html.zig` covers the pure text
 logic (`normalizeHtml`, `containsAny`, `extractKeywordContext`) and `src/state.zig`
 covers `capTail` and the `State` lookups; `src/parquet.zig` adds tests for the
 Parquet encoder's primitives (zigzag varints, compact field headers, the file
 envelope). `src/main.zig` is the test root: its `test {}` block references every
 module (`_ = parquet;`, `_ = @import("html.zig");`, …) so all of those tests run
-under `zig build test`. They need no network. The I/O paths (curl, state file,
-notify) are exercised end-to-end by running the binary, see `just demo`,
-`just test-notify`, and `just test-no-deps`.
+under `zig build test`. They need no network. The suite includes v5 lease/status
+invariants, corrupt-state inspection, last-known-good recovery/rebaseline audit,
+segmented-log failure modes, strict configuration, preflight JSON, delivery
+retry/fencing, reader SSRF policy, and UI delivery totals. Shell integration
+tests cover fixture restoration, state compatibility, installer transactions and
+hostile values, documentation/source schema, 2x log capacity, and DuckDB Parquet
+interoperability.
 
 Parquet **format** correctness can't be checked by std-only Zig (it can't parse
 Parquet back), so verify it by reading an exported file with a real reader; the
@@ -85,7 +90,7 @@ The most useful:
 
 | Recipe | Purpose |
 |---|---|
-| `just ci` | `fmt-check` + `test` + `build`, the full pre-push gate. |
+| `just ci` | Formatting, 147 unit tests, build, E2E/notify/installer/env/state/log/docs/scanner/Parquet/package tests, and ShellCheck; the full pre-push gate. |
 | `just demo` | Baseline run + no-change run against a temp state file. |
 | `just run` | One real poll against a throwaway state file. |
 | `just export` | Write Parquet tables (`events`, `state_seen`, `state_keyword_hashes`) to `./parquet`. |
@@ -100,11 +105,20 @@ development runs never touch real scheduled state.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push and pull request: it installs Zig
-0.16.0 (`mlugg/setup-zig@v2`), then runs `zig build test`, `zig build`, and
-`zig fmt --check src/ build.zig`. Keep the pinned Zig version here in step with
-`minimum_zig_version` in `build.zig.zon`. Run `just ci` locally to reproduce the
-gate before pushing.
+`.github/workflows/ci.yml` runs on every push and pull request. It installs Zig
+0.16.0 and the validation dependencies, then invokes the same `scripts/ci.sh`
+gate as `just ci`, including the offline restoration E2E, hostile-input notify
+and installer tests, state compatibility, log capacity, documentation links and
+source schema, scanner configuration, ShellCheck, DuckDB Parquet
+interoperability, and clean-tree release packaging. Actions and the betterleaks
+image are pinned by commit/digest. Keep Zig in step with `minimum_zig_version` in
+`build.zig.zon`. Run `just ci` locally to reproduce the gate before pushing.
+
+A separate scheduled workflow contains a sanitized one-source live canary, but
+it runs only when repository variable `ENABLE_LIVE_CANARY=true`; workflow
+presence is not evidence that a hosted canary has passed. Reliable Zig 0.16 code
+coverage tooling remains unavailable, so `scripts/ci.sh` reports that blocker
+rather than publishing a false threshold.
 
 ## Formatting
 
@@ -172,11 +186,12 @@ pathologically large. The probe is `getrusage(2)`, so it costs nothing.
 
 ### Disk
 
-State is capped (200 document numbers) so it stays tiny. The observation log
-grows with *events* (not poll frequency), a baseline is ~2–3 KB compressed and
-it only grows when something actually changes; rotate it if it ever matters
-(see [data-export.md](data-export.md) / [design-decisions.md](design-decisions.md)
-decision 9).
+State caps Federal Register keys at 300 and feed keys at 500 per source; settled
+alerts expire after 90 days and fully delivered outbox records are removed. The
+observation log grows with *events* (not poll frequency) and appends one zstd
+frame per run. Automatic compaction retains the configured maximum event count;
+archive its base and sidecars as described in [data-export.md](data-export.md)
+and [design-decisions.md](design-decisions.md) decision 9.
 
 ## Documentation maintenance (read before changing behavior)
 
@@ -188,16 +203,11 @@ and the **code → doc map** live in [docs/README.md](README.md). In short:
    and refresh every stamp at release time after a skim.
 3. New subsystem → new row in the code→doc map + a stamped doc.
 
-Reviewers are the enforcement mechanism: a behavior change with stale docs is an
-incomplete change. If CI doc-freshness enforcement is added later, document it
-here and in [docs/README.md](README.md).
+`tests/docs_schema.sh` checks local Markdown links, every doc review stamp, the
+default source schema, and documented source kinds. Reviewers still enforce
+behavioral accuracy: a behavior change with stale prose is incomplete.
 
 ## Releasing
 
-1. Bump `version` in `build.zig.zon` only, it is the single source of truth.
-   `build.zig` generates a `build_options` module from `build.zig.zon`'s
-   `version`, and the binary reads it via `@import("build_options").version`, so
-   there is no second constant to keep in sync.
-2. Run `just ci`.
-3. Skim every doc in `docs/` and refresh the `Last reviewed:` stamps.
-4. Tag the release.
+See [release.md](release.md). The tag workflow builds baseline-CPU Linux and
+macOS archives, checksums, SPDX SBOM, provenance, and keyless signatures.

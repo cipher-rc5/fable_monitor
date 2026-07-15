@@ -1,6 +1,6 @@
 # Architecture
 
-Last reviewed: 2026-06-28 · against fable-monitor 0.1.0 (feat/tiered-monitor)
+Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
 
 `fable-monitor` is a single-binary CLI with one job: detect when an official
 source says something new about the export-control status of Anthropic's
@@ -12,8 +12,8 @@ deliberately small. The code is split into focused modules under `src/`:
   internal loop, and the test root. The poll orchestration now lives in
   `poll.zig`, not here.
 - `poll.zig`: the poll orchestrator. `run` (one poll), the per-kind detectors,
-  signal coalescing / trip resolution, structured-event emission, and the
-  `preflight` / `audit` / `acknowledge` subcommand entry points.
+  signal coalescing / trip resolution, durable delivery, and the `preflight` /
+  `audit` / `acknowledge` / delivery subcommand entry points.
 - `config.zig`: `Config` and `load`, which parse the JSON source config
   (embedded default or `FABLE_MONITOR_SOURCES`) into `Source` values and apply
   the enable/disable overrides.
@@ -26,8 +26,9 @@ deliberately small. The code is split into focused modules under `src/`:
   with a stable key, title, and publication timestamp).
 - `html.zig`: `normalizeHtml`, `extractKeywordContext`, `containsAny`
   (pure text helpers).
-- `state.zig`: `State`, `StateRecord`, `loadState`, `saveState`, `capTail`
-  (the v2 record kinds).
+- `state.zig`: state v5 parsing/commit, migration, locks, alerts, recovery, and
+  lease-fenced delivery
+  records.
 - `events.zig`: `Event`, the event-kind constants, `isoUtc`, `epochMsFromIso`,
   `appendLog`.
 - `zstd.zig`: `compress` / `decompress` / `compressor` (zstd helpers).
@@ -48,11 +49,12 @@ directly and is unit-testable with explicit options.
 
 ## The governing idea: one run = one poll
 
-The tool is **not** a long-running daemon. Each invocation does exactly one pass
+The poll command is one-shot by default. Each invocation does exactly one pass
 over the sources and then exits. Recurring execution is the scheduler's job
 (launchd or cron, see [deployment.md](deployment.md)). This keeps the process
-model trivial: no event loop, no timers, no in-memory state to corrupt, and a
-crash affects at most one poll. Continuity across runs comes entirely from a
+model trivial, and a crash affects at most one poll. `FABLE_MONITOR_LOOP` is an
+optional long-lived mode with a fresh arena per tick and a consecutive-failure
+exit threshold. Continuity across runs comes entirely from a
 small JSON state file (see [state-format.md](state-format.md)).
 
 ## Subcommands
@@ -60,14 +62,16 @@ small JSON state file (see [state-format.md](state-format.md)).
 The mode is selected by `argv[1]` (default `poll`):
 
 - **(default) / `poll`**: one poll pass over the due sources, described below.
-- **`preflight`**: verify the runtime is ready before scheduling (the `curl`
-  and `zstd` binaries, write access to the state path, per-source network
-  egress, and the presence of the optional secrets: webhook / heartbeat /
-  notify). Prints one summary; returns an error on a hard failure.
-- **`audit`**: print each source's last successful fetch and last detected
-  change (from the `status` state records), to catch a quietly dead source.
-  Reads state only.
+- **`preflight [--json]`**: verify config, dependencies, writable state/log/
+  outbox paths, disk, source egress/schema, decisive coverage, and sink/secret
+  configuration. JSON uses `fable-monitor.preflight/1`; failed checks exit 1.
+- **`audit`**: print each source's last successful fetch/change plus pending and
+  failed delivery totals. Reads state only.
 - **`ack <event_id>`**: mark a fired alert acknowledged so it stops escalating.
+- **`delivery list` / `delivery retry [event_id|occurrence_id]`**: inspect or
+  force retry of durable pending sink work.
+- **`state inspect|recover|rebaseline`**: emit JSON state diagnostics or perform
+  an explicit locked restore/rebaseline with quarantine and recovery audit.
 - **`log [filters]`** / **`view [filters]`**: print the observation log as a
   formatted table (reads + decompresses it, no network). `view` is a dataview
   preset over the same reader (last 90 days, newest-first). See
@@ -82,13 +86,13 @@ The mode is selected by `argv[1]` (default `poll`):
 
 `main` builds the `Context` and `poll.Options` from the environment, runs the
 `zstd` (and, for a poll, `curl`) preflight, then calls `poll.run(&ctx, opts)`.
-That function is the pipeline: **fetch -> detect -> coalesce -> trip -> emit.**
+That function is the pipeline: **fetch -> detect -> coalesce -> audit -> commit -> deliver.**
 
 1. **Load config + state.** `config.load` parses the source config (embedded
    default or `FABLE_MONITOR_SOURCES`) and applies the ONLY / DISABLE overrides;
-   `state.loadState` reads the previous state. A missing/unreadable state file is
-   non-fatal: the run starts fresh (first-run / baseline behavior). The
-   cumulative sets and alert bookkeeping are carried forward.
+   `state.loadState` reads the previous state. Only `FileNotFound` means first
+   run; corrupt, malformed, or future state fails the poll without overwriting
+   the generation. Cumulative sets, alerts, and deliveries carry forward.
 2. **Select due sources.** Each enabled source is polled only if it is *due* this
    tick: tier-1 (`fast`) sources on the `fast_interval`, tier-2/3 (`slow`) on
    `slow_interval_s`, gated by the per-source `last_poll_ms` in state. A source
@@ -96,8 +100,9 @@ That function is the pipeline: **fetch -> detect -> coalesce -> trip -> emit.**
    fixture run or `FABLE_MONITOR_FORCE=1` polls everything.
 3. **Fetch.** Each due source is fetched with a conditional request carrying its
    persisted ETag / Last-Modified (or read from a fixture file in test mode),
-   timed, and wrapped in its own error handler so one failure never aborts the
-   poll. A 304 keeps the prior content records and records nothing new.
+   timed, and wrapped in its own error handler so another source can still run.
+   A failed fetch preserves the previous baseline as unknown, never absence. A
+   304 keeps prior content records and records nothing new.
 4. **Detect.** Dispatch on `SourceKind` to a detector (model-list probe,
    statement/keyword watch, Federal Register, feed, market). Detectors append
    `Event` rows to the audit accumulator and emit trip **`Signal`s**.
@@ -106,17 +111,36 @@ That function is the pipeline: **fetch -> detect -> coalesce -> trip -> emit.**
    yields one alert listing all corroborating sources. A tier-2/3 advisory is
    promoted to high confidence when corroborated by a second distinct source on
    the same identity (or by an inherently-high tier-1 signal).
-6. **Trip + emit (idempotent).** For each new identity, emit one structured JSON
-   event to stdout (and the optional sink file / webhook), fire the notify hook
-   for high-confidence trips, and record an `alert` so the same persisting change
-   does not re-fire. An unacknowledged high-confidence alert re-fires once after
-   `FABLE_MONITOR_ESCALATE_AFTER` seconds. Escalation is intentionally
-   **once-per-alert**: a single re-fire, then silence until `ack` — a monitor
-   that keeps nagging trains its operator to ignore it.
-7. **Persist + log + heartbeat.** Save the merged state (FR seen-set capped at
-   300, feed seen-set at 500), append this run's events to the observation log,
-   print the per-run metrics line, and ping `FABLE_MONITOR_HEARTBEAT_URL` after a
-   clean run (the dead-man's switch).
+6. **Create occurrence + outbox.** `event_id` is the logical subject identity.
+   A new active episode gets an immutable `occurrence_id`; escalation gets a
+   second occurrence. Required delivery records are queued for stdout and every
+   configured file/webhook/notify sink. The occurrence ID is the idempotency key.
+7. **Audit + commit.** Append this run's observation events as a committed zstd
+   frame first. Only after that succeeds, atomically save state v5, including all
+   outbox records. This ordering prevents a log failure from advancing detector
+   baselines past an unrecorded transition. Either failure makes the poll failed;
+   no sink side effect starts before both commits.
+8. **Deliver + classify.** Claim due records under the state lock, perform side
+   effects outside it, and checkpoint each result. Failures retry with bounded
+   exponential backoff and jitter. The outcome is `healthy` when decisive
+   coverage is fresh and no source/heartbeat fails, `degraded` for a
+   non-coverage source or heartbeat failure, and `failed` for inadequate
+   coverage, persistence, or pending delivery. Only healthy runs ping success.
+
+## Event identity and re-arm
+
+`event_id` identifies the logical subject, such as
+`model_present:claude-fable-5` or `statement_restored`. `occurrence_id` identifies
+one immutable initial or escalation delivery occurrence and is the
+deduplication key. Replays after a crash preserve it.
+
+Model episodes re-arm only after at least one successful model-list/API source
+observes the model absent across current successful observations. Statement
+restoration re-arms only after a successful statement observation contains no
+present restoration terms. Failed fetches do neither. Keyword, market, feed,
+and Federal Register identities have no explicit absence-based re-arm: their
+identities encode source/content/document keys and active alert records suppress
+repeats. Settled alerts are pruned after 90 days; unresolved alerts are retained.
 
 ## Components
 
@@ -138,12 +162,11 @@ That function is the pipeline: **fetch -> detect -> coalesce -> trip -> emit.**
               │              │                       │              │  detectMarket
               └──────────────┴───────────┬───────────┴──────────────┘
                                          ▼  Signals
-                          resolveTrips: coalesce by identity,
-                          promote on corroboration, alert-once
+                          resolveTrips: coalesce by subject,
+                          create occurrence + per-sink outbox
                                          ▼
-                  emitStructured → stdout + sink + webhook
-                  notify (high-confidence) → sh -c
-                  save state · append log · heartbeat
+                  append log → save state → claim/deliver/checkpoint
+                  classify outcome → healthy-only heartbeat
 ```
 
 ### Fetching: `fetch.fetchConditional` / `postJson` / `pingHeartbeat`
@@ -153,19 +176,20 @@ All network I/O is delegated to the system `curl` binary via `std.process.run`
 from the persisted validators so an unchanged source returns 304 cheaply, honors
 `429`/`Retry-After` with a capped backoff, and reports the new validators plus a
 per-fetch latency. `postJson` POSTs a structured event to the webhook;
-`pingHeartbeat` hits the dead-man's-switch URL. `toolAvailable(ctx, name)` is the
+`pingHeartbeat` hits the dead-man's-switch URL. Webhook and heartbeat URLs are
+placed in mode-0600 curl config files rather than process arguments; only 2xx is
+success. `toolAvailable(ctx, name)` is the
 shared `<name> --version` preflight used for both `curl` and `zstd`. Rationale in
 [design-decisions.md](design-decisions.md).
 
-> **Serial in this build, concurrency reserved.** The config carries a
-> `concurrency` field, but this build fetches sources serially, logging
-> per-source and total wall-clock latency. Parallel fetch is reserved for a
-> future build; nothing in the pipeline depends on it.
+> **Serial in this build.** Sources are fetched serially, logging per-source and
+> total wall-clock latency. Nothing in the pipeline implies parallel fetching.
 
 ### Detectors (`poll.zig`)
 
-- **`detectModelList`** (tier-1, decisive). Normalizes the listing text and
-  checks each model id for presence. An **absent-to-present** transition (the id
+- **`detectModelList`** (tier-1, decisive). Exact-matches typed `data[].id` for
+  the API probe and boundary/negation-aware visible text for HTML probes. An
+  **absent-to-present** transition (the id
   was not present on a prior poll and now is) emits a high-confidence
   `restoration` signal keyed `model_present:<id>`. The first poll of a source is
   a baseline and never trips.
@@ -173,29 +197,31 @@ shared `<name> --version` preflight used for both `curl` and `zstd`. Rationale i
   (tier-2/3) and `statement_watch` (tier-1): `extractKeywordContext` keeps a
   ±100-byte window around each `match` hit, sorts and de-duplicates the windows,
   and Wyhashes them. A changed hash on the statement page whose new context
-  contains restoration vocabulary is a high-confidence trip
-  (`statement_restored`); any other change is advisory.
+  gains a non-negated restoration term near a controlled model reference is a
+  high-confidence trip (`statement_restored`); any other change is advisory.
 - **`detectFederalRegister`** (tier-2). Parses the FR / public-inspection JSON
   into a minimal projection (`ignore_unknown_fields = true`), records each new
-  document number, and applies the tightened relevance filter (title + abstract
-  against the strong terms). Relevant docs emit an advisory keyed `fr_doc:<num>`,
-  so the same document on multiple FR feeds coalesces.
+  stage-qualified document key, and applies the tightened relevance filter (title + abstract
+  against the strong terms). Relevant docs emit an advisory keyed
+  `fr_doc:<stage>:<num>`,
+  so preliminary and published records can be evaluated independently.
 - **`detectFeed`** (tier-3). `feed.parse` extracts RSS/Atom/sitemap entries by
   stable key; the first poll baselines the backlog without alerting, then new
   matching entries emit advisories keyed `feed:<key>`.
 - **`detectMarket`** (tier-3). Records the last price and emits an advisory on a
   `>= 0.10` move (`market:<id>`), a coverage-gap signal only.
 
-### Emitting: `emitStructured` / `notify`
+### Delivering: state-v5 outbox
 
-The integration point. `resolveTrips` emits exactly one structured JSON event per
-new identity to stdout always (schema `fable-monitor.event/1`), plus the optional
-`FABLE_MONITOR_EVENT_SINK` append-file and `FABLE_MONITOR_WEBHOOK` POST. The
-portable `FABLE_MONITOR_NOTIFY` hook fires for high-confidence trips and
-escalations, invoked as `sh -c <cmd> fable-monitor <message>` so the alert text
-arrives as `$1` (injection-safe). The monitor's responsibility ends at emitting
-the verified signal; any trading/execution system consumes the event in a
-separate process.
+All configured sinks are required. Delivery is durable and at least once: a
+crash after a sink accepts data but before checkpoint can replay the same
+occurrence. The event-sink file deduplicates by occurrence, and webhooks receive
+`Idempotency-Key`; stdout/notify consumers must deduplicate themselves. The
+notify command receives remote-derived text as `$1`, not interpolated shell
+source. Each claim gets a random lease token. Completion applies only when that
+token still matches, so an expired claimant cannot overwrite a newer success.
+On v4-to-v5 save, tokenless v4 leases are cleared rather than preserved as
+unfenced claims.
 
 ### Compression, `zstd.compress` / `zstd.decompress` / `zstd.compressor`
 
@@ -210,11 +236,17 @@ builds the `parquet.Compressor` thunk used by the export path. See
 
 ### History & export, `events.appendLog` / `export.exportParquet` / `src/parquet.zig`
 
-Alerts are ephemeral (stdout); the history of findings is durable. As each
+Alert side effects are emitted from the durable outbox; the history of findings
+is durable. As each
 source alerts it also calls `ctx.record(...)`, building a list of `Event`
-structs stamped with the run's timestamp. After state is saved,
-`events.appendLog` decompresses the existing log (`FABLE_MONITOR_LOG`), appends
-this run's events as JSONL, recompresses, and rewrites it.
+structs stamped with the run's timestamp. `events.appendLog` atomically commits
+the audit batch before detector state advances; state v5 then commits outbox
+work before delivery starts. A manifest selects the current compacted base and
+active segments, so torn writes are never reader-visible. Reads may fall back to
+a validated manifest backup, while append/compaction require explicit `log
+recover` first. Automatic retention and `log compact` rewrite the newest
+configured number of events as a new base generation before atomically switching
+that manifest.
 
 The `export` subcommand (`export.exportParquet`) is the read side: it decompresses and
 parses the JSONL log and state file and emits Parquet tables via the encoder in
@@ -224,8 +256,9 @@ fatal. Full details and schema are in [data-export.md](data-export.md).
 
 ## Memory model
 
-Everything allocates from a single arena (`init.arena`) that lives for the whole
-process and is released on exit. Because a run is short and bounded, there is no
+One-shot commands allocate from the startup arena and release it on exit. Loop
+mode creates and resets a per-tick arena, retaining one tick's capacity. Because
+a run is short and bounded, there is no
 per-source free; the arena is freed wholesale when the process ends. This is a
 deliberate simplification that the one-run-one-poll model makes safe.
 
@@ -246,7 +279,7 @@ somewhere while still seeing operational logs.
 - No HTTP/TLS stack of its own (delegated to curl).
 - No in-process compression (delegated to the zstd binary; std has no encoder).
 - No diff of *what* changed on a watched page (only that it changed).
-- No parallel fetch in this build (the `concurrency` field is reserved).
+- No parallel fetch in this build.
 - No model in the decisive path: the optional classifier-confirmation sidecar is
   designed but deferred and never gates a tier-1 trip (see [sources.md](sources.md)).
 

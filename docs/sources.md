@@ -1,6 +1,6 @@
 # Sources
 
-Last reviewed: 2026-06-28 · against fable-monitor 0.1.0 (feat/tiered-monitor)
+Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
 
 A *source* is one thing the monitor polls. Sources are **no longer hard-coded**:
 they are described by a JSON config document, loaded at runtime by
@@ -21,13 +21,35 @@ tier-1 path is optimized for latency, the tier-2/3 paths for precision.
 | **tier2** | The official regulatory record. High precision but day-of (or hours-ahead) latency. Tripped as an advisory until corroborated. | Federal Register, Federal Register public inspection, BIS news |
 | **tier3** | Early but noisy, advance warning only. Advisory; never auto-actioned on its own. | newsroom sitemap, Google News, prediction markets |
 
-The default config ships **four independent tier-1 trippers**
+The default config ships **four tier-1 trippers**
 (`anthropic_model_list`, `anthropic_pricing`, `anthropic_statement`, and the
-`anthropic_api_models` API probe), so there is no single point of failure in the
-decisive signal path: any one of them seeing restoration is enough. The API
-probe is the most authoritative (it confirms the model is actually callable) but
+`anthropic_api_models` API probe), so any one of them seeing restoration is
+enough. The API probe is a structured authenticated listing signal, not a
+completion/callability test, and
 requires `ANTHROPIC_API_KEY`; when that is unset it is skipped and the other
-three still cover the decisive path.
+three still cover the decisive path. These are separate endpoints, but the two
+public HTML model pages share an operator/content family and are not counted as
+independent corroboration by the promotion logic.
+
+### Embedded endpoints
+
+These are the current URLs in `src/sources_default.json`; an external config can
+replace them without rebuilding.
+
+| ID | URL |
+|---|---|
+| `anthropic_model_list` | <https://platform.claude.com/docs/en/about-claude/models/overview> |
+| `anthropic_pricing` | <https://claude.com/pricing> |
+| `anthropic_api_models` | <https://api.anthropic.com/v1/models?limit=100> |
+| `anthropic_statement` | <https://www.anthropic.com/news/fable-mythos-access> |
+| `fr_pi_bis` | `https://www.federalregister.gov/api/v1/public-inspection-documents.json?conditions%5Bagencies%5D%5B%5D=industry-and-security-bureau&per_page=20` |
+| `fr_pi_anthropic` | `https://www.federalregister.gov/api/v1/public-inspection-documents.json?conditions%5Bterm%5D=Anthropic&per_page=20` |
+| `fr_anthropic` | `https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest&conditions%5Bterm%5D=Anthropic` |
+| `fr_bis` | `https://www.federalregister.gov/api/v1/documents.json?per_page=20&order=newest&conditions%5Bagencies%5D%5B%5D=industry-and-security-bureau` |
+| `bis_news` | <https://www.bis.gov/news-updates> |
+| `anthropic_sitemap` | <https://www.anthropic.com/sitemap.xml> |
+| `google_news` | `https://news.google.com/rss/search?q=Anthropic%20export%20control%20Fable%20Mythos&hl=en-US&gl=US&ceid=US:en` |
+| `polymarket` | `https://clob.polymarket.com/prices-history?market=PLACEHOLDER&interval=1h` (disabled until configured) |
 
 ## The config file
 
@@ -38,7 +60,6 @@ The top-level shape:
   "version": 1,
   "fast_interval_s": 45,
   "slow_interval_s": 1800,
-  "concurrency": 1,
   "sources": [ ... ]
 }
 ```
@@ -48,7 +69,6 @@ The top-level shape:
 | `version` | 1 | Config schema version. |
 | `fast_interval_s` | 45 | Cadence (seconds) for `fast`-poll sources (tier-1). Overridable per run with `FABLE_MONITOR_FAST_INTERVAL`. |
 | `slow_interval_s` | 1800 | Cadence (seconds) for `slow`-poll sources (tier-2/3). |
-| `concurrency` | 1 | Reserved. Parallel fetch is *configured* but this build fetches serially (see [architecture.md](architecture.md)). |
 | `sources` | (n/a) | The array of source objects. |
 
 Each source object:
@@ -59,7 +79,7 @@ Each source object:
   "kind": "model_list_probe",
   "tier": 1,
   "label": "Anthropic public model listing",
-  "url": "https://docs.anthropic.com/en/docs/about-claude/models/overview",
+  "url": "https://platform.claude.com/docs/en/about-claude/models/overview",
   "match": ["claude-fable-5", "claude-mythos-5"],
   "enabled": true,
   "poll": "fast",
@@ -69,9 +89,9 @@ Each source object:
 
 | Field | Required | Default | Meaning |
 |---|---|---|---|
-| `id` | yes | (n/a) | Stable key; used in state, logs, and event identities. Never reuse or rename (renaming orphans the source's state and re-baselines it). A source missing `id` or `url` is skipped with a warning. |
-| `kind` | yes | (n/a) | One of the source kinds below. An unknown kind is skipped with a warning. |
-| `tier` | no | 3 | 1, 2, or 3. An out-of-range value clamps to tier3. |
+| `id` | yes | (n/a) | Stable, unique, non-empty key; used in state, logs, and event identities. Never reuse or rename (renaming orphans state and re-baselines it). |
+| `kind` | yes | (n/a) | One of the source kinds below; unknown kinds reject the configuration. |
+| `tier` | no | 3 | 1, 2, or 3; an out-of-range value rejects the configuration. |
 | `label` | no | `id` | Human-readable name shown in alerts and logs. |
 | `url` | yes | (n/a) | What `curl` fetches. |
 | `match` | no | by kind | Keyword / term / model-id set that marks this source's content high-signal; for the watch kinds it is also the set whose context is fingerprinted. When empty, defaults to a kind-appropriate vocabulary (model ids for `model_list_probe`, restoration terms for `statement_watch`, the global keywords otherwise). |
@@ -79,20 +99,25 @@ Each source object:
 | `poll` | no | by tier | `"fast"` or `"slow"`. Defaults to `fast` for tier-1, `slow` for tier-2/3. |
 | `lead_time` | no | "" | Free-text note on the expected lead time of this source's signal. |
 
-Parsing is lenient and **fails closed per source**: unknown fields are ignored,
-a malformed source entry is skipped with a warning rather than aborting the
-load, and an unreadable or invalid external file falls back to the embedded
-default. The monitor always has sources to poll.
+JSON decoding rejects unknown fields, and semantic validation is fail-closed for
+the configuration as a whole. Unsupported schema versions, invalid intervals,
+malformed/duplicate sources, non-HTTPS/credentialed/non-443 URLs, unknown
+override IDs, invalid required
+coverage, and an all-disabled effective set terminate startup. An explicitly
+selected unreadable or invalid file never falls back to the embedded default.
+All poll requests are HTTPS-only and do not follow redirects. A 3xx response is
+a source failure rather than an unchecked hop; update and review a changed
+endpoint in the source config instead of relying on redirect behavior.
 
 ## Source kinds
 
 | `kind` | Tier (typical) | What it does |
 |---|---|---|
 | `model_list_probe` | 1 | Reads the public model listing (metadata only, never a completion) and detects an **absent-to-present** transition of the controlled model identifiers (`claude-fable-5`, `claude-mythos-5`). The first observation of a source is a baseline and never trips. The transition is the single most decisive, highest-precision confirmation that access is live. |
-| `api_probe` | 1 | Same **absent-to-present** detection as `model_list_probe`, but against the authoritative Anthropic **`/v1/models`** API — the ground-truth "the model is actually callable" signal. Reuses the same detector (substring-scans the JSON body for the controlled ids). Requires an API key: it reads `ANTHROPIC_API_KEY` from the environment, sends it as the `x-api-key` header (with `anthropic-version: 2023-06-01`), and **skips gracefully with a single log line when the key is unset** (no fetch, no error), so the build, tests, and a keyless poller run fine. The key is only ever placed in a request header, never in a URL or any log line. |
-| `statement_watch` | 1 | Fingerprints the keyword context of the dedicated statement page. A change whose new context contains restoration vocabulary (`restored`, `resumed`, `reinstated`, `reauthorized`, `available`, `lifted`, `rescinded`, `vacated`, ...) is a high-confidence trip; any other change is advisory. |
-| `federal_register` | 2 | Polls the Federal Register documents JSON API; tracks new document numbers. A tightened relevance filter decides high-signal: the title or abstract must name Anthropic or a specific model (`fable 5`, `claude-fable-5`, ...), not merely contain the bare word "fable". |
-| `federal_register_public_inspection` | 2 | Same shape as `federal_register`, but against the public-inspection feed. These documents post *before* official publication, so they are an earlier signal. |
+| `api_probe` | 1 | Parses the Anthropic `/v1/models` JSON schema and exact-matches only typed `data[].id` model objects. Requires `ANTHROPIC_API_KEY`; without it the source is skipped unless selected as required, in which case coverage fails. Auth uses a mode-0600 header file and authenticated requests do not follow redirects. |
+| `statement_watch` | 1 | Persists the non-negated restoration terms near a controlled model reference. Only an absent-to-present term transition from a known successful v3+ baseline is high confidence; other context changes are advisory. |
+| `federal_register` | 2 | Polls the published-documents JSON API and tracks stage-qualified document keys. Publication is reevaluated even if the number appeared in public inspection. A tightened relevance filter requires Anthropic or a specific model, not bare "fable". |
+| `federal_register_public_inspection` | 2 | Reads the preliminary public-inspection feed. A normal response has `results`; the Federal Register's temporary `meta.pil_unavailability_message` envelope is recognized as a valid upstream shape by preflight, but a poll treats it as temporarily unavailable rather than as an empty result or schema drift. Documents post before official publication and use a distinct stage key. |
 | `feed_watch` | 3 | Parses RSS / Atom / sitemap structure (guid / link / loc) instead of fingerprinting rendered HTML, which cuts layout-churn false positives. The first poll baselines the entire current backlog without alerting. |
 | `keyword_watch` | 2/3 | The original best-effort signal for pages with no structured feed: hash a normalized, keyword-windowed projection of the page and diff it. Reports *that* something near a keyword changed, not *what*. |
 | `market_watch` | 3 | Records the last prediction-market price and flags a `>= 0.10` move. Advisory only; its purpose is to reveal a coverage gap (a faster source than our own) rather than to auto-action. The shipped `polymarket` entry has `"enabled": false` because its URL still carries a `PLACEHOLDER` market id — flip it on (external config or `FABLE_MONITOR_ONLY`) only after substituting a real id. |
@@ -113,8 +138,10 @@ exactly how the `just demo-restore` recipe scopes a fixture replay to the
 tier-1 sources.
 
 Sources also **fail closed at runtime**: one source erroring (network, parse,
-...) logs an error and continues; it never aborts the poll or suppresses the
-others. See per-source error isolation in
+...) logs an error and lets other sources run, but the run is at least degraded.
+It is failed if required/minimum decisive freshness is absent. See
+`FABLE_MONITOR_REQUIRED_SOURCES` and `FABLE_MONITOR_MIN_DECISIVE_SOURCES` in
+[deployment.md](deployment.md), plus per-source error isolation in
 [design-decisions.md](design-decisions.md).
 
 ## Overriding the config
@@ -122,9 +149,11 @@ others. See per-source error isolation in
 Set `FABLE_MONITOR_SOURCES` to an absolute path to a JSON file in the config
 shape above. Validate it with a dry poll against a throwaway state file
 (`FABLE_MONITOR_STATE=/tmp/x.zst ... poll`) and confirm the startup line reports
-the expected source count and origin. `fable-monitor preflight` then checks
-egress to each enabled source. To edit the *defaults*, change
-`src/sources_default.json` and rebuild.
+the expected source count and origin. `fable-monitor preflight --json` then
+checks egress and response shape for each enabled source. To edit the *defaults*, change
+`src/sources_default.json` and rebuild. For automation, `preflight --json`
+returns `fable-monitor.preflight/1` checks with stable categories for egress,
+schema, and decisive coverage.
 
 ## The detection vocabularies
 

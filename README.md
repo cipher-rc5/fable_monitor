@@ -6,8 +6,10 @@ emits a verified, low-latency signal when access comes back.
 
 It runs as a scheduled job (launchd, systemd, or cron). Each invocation is one
 poll: it fetches the sources that are due this tick, runs a per-kind detector,
-coalesces corroborating signals into one alert, persists updated state, and on a
-trip emits a structured JSON event (and optionally fires a notification hook).
+coalesces corroborating signals into one alert, commits the observation batch,
+then commits updated state and a durable per-sink outbox before delivering the
+structured JSON event and optional notification hook. Audit-first ordering means
+a log failure cannot advance detector baselines past an unrecorded transition.
 The monitor's job ends at emitting the verified signal; any system that acts on
 it lives in a separate process.
 
@@ -15,8 +17,8 @@ it lives in a separate process.
 
 Sources are described by a JSON config (an embedded default, overridable via
 `FABLE_MONITOR_SOURCES`) and graded into three confidence tiers. The default
-config ships 11 sources, including three independent tier-1 trippers so there is
-no single point of failure in the decisive path.
+config ships 11 sources, including four tier-1 trippers. The authenticated API
+probe is skipped unless `ANTHROPIC_API_KEY` is set; three public probes remain.
 
 - **Tier 1 (decisive, lowest latency).** The public model listing and pricing
   page (a `model_list_probe` detects an absent-to-present transition of
@@ -47,18 +49,21 @@ Parquet writer) is standard library.
 Each poll sends conditional requests (ETag / If-Modified-Since) so unchanged
 sources return 304 cheaply, and only polls sources that are *due*: tier-1 on a
 fast loop, tier-2/3 on a slow loop. State is a single zstd-compressed
-line-delimited JSON file (format v2; v1 files still load). The Federal Register
-seen-set is capped at the most recent 300 document numbers so it does not grow
-without bound.
+line-delimited JSON file (format v5; v1-v4 files migrate on the next save). V4
+added occurrence IDs and durable per-sink delivery records; v5 adds random lease
+tokens that fence delivery completion and repairs legacy status ordering during
+migration. The Federal Register
+seen-set is capped at 300 entries, and feed keys at 500 per source.
 
-> Fetching is serial in this build; the config's `concurrency` field is reserved
-> for a future parallel-fetch build.
+Fetching is serial in this build; no configuration option implies otherwise.
 
 Alongside the state snapshot, each poll records its findings to an observation
-log (compressed JSONL), giving a queryable history of what changed and when. The
+log (segmented compressed JSONL), giving a queryable history of what changed and when. The
 `export` subcommand projects that log and the current state into (ZSTD-coded)
 Parquet tables for analysis, see [Reading the data](#reading-the-data)
 below and [`docs/data-export.md`](docs/data-export.md).
+Immutable per-run segments are published through an atomic manifest and compact
+to the newest 100,000 rows by default.
 
 ## Build
 
@@ -79,7 +84,7 @@ runner layered on top of `zig build`, not a replacement for it. Install with
 
     just              # list all recipes
     just test         # run unit tests
-    just ci           # fmt-check + test + build (run this before pushing)
+    just ci           # full local CI parity gate (run this before pushing)
     just demo         # baseline run + no-change run, against a temp state file
     just run          # one real poll against a throwaway state file
     just export       # write Parquet tables to ./parquet
@@ -92,21 +97,40 @@ The mode is selected by the first argument (default `poll`):
 | Command | Does |
 |---|---|
 | `poll` (default) | One poll pass over the due sources. |
-| `preflight` | Verify deps, state-path writability, per-source egress, and secrets before scheduling. |
-| `audit` | Each source's last successful fetch and last detected change (catch a quietly dead source). |
+| `preflight [--json]` | Verify config, deps, writable state/log/outbox paths, disk, source egress/schema, coverage, and sink/secret configuration. JSON uses schema `fable-monitor.preflight/1`. |
+| `audit` | Each source's last successful fetch/change plus pending/failed delivery totals. |
 | `ack <event_id>` | Acknowledge a fired alert so it stops escalating. |
+| `delivery list` | Inspect durable per-sink delivery status and errors. |
+| `delivery retry [event_id\|occurrence_id]` | Force pending delivery retries, optionally filtered. |
+| `state inspect` | Print payload-free state status/version/line diagnostic as JSON. |
+| `state recover` | Validate and restore `<state>.backup`, quarantine the active generation, and print the result as JSON. |
+| `state rebaseline` | Quarantine the active generation, record recovery audit metadata, and intentionally leave state absent. |
 | `view` / `log` | Read the observation log as a formatted table (see below). |
+| `log compact [max_events]` | Force compaction and retain the newest rows. |
+| `log recover` | Validate the logical log through its manifest backup, then restore the primary manifest. |
 | `export [out_dir]` | Project the log + state into Parquet tables. |
-| `serve [port]` | Serve the read-only web dashboard (htmx + Tailwind v4) over the log + state. See [Web UI](#web-ui). |
+| `serve [port]` | Serve the read-only local-asset web dashboard over the log + state. See [Web UI](#web-ui). |
 | `banner [text] [height]` | Render text as a TrueType terminal banner. |
 
 ## Quickstart
 
 ```sh
 zig build
-./zig-out/bin/fable-monitor preflight          # deps, state path, egress, secrets
+./zig-out/bin/fable-monitor preflight --json   # automation-friendly readiness checks
 just demo-restore                               # offline fixture replay: baseline (silent) then a tier-1 trip
 ```
+
+Automation output is one JSON object. Representative shapes:
+
+```json
+{"schema":"fable-monitor.preflight/1","ok":true,"checks":[{"name":"sources_config","category":"config","status":"pass","source_id":"","detail":"embedded default"}]}
+{"status":"valid","version":5,"diagnostic":{"line":0,"reason":"none"}}
+{"action":"recover_backup","quarantine_path":"state.zst.corrupt.123","backup_path":"state.zst.backup","restored_version":5}
+```
+
+The latter two come from `state inspect` and `state recover`; `state rebaseline`
+uses action `rebaseline`, a null backup path, and the quarantine path when an
+active generation existed. State diagnostics never include record payloads.
 
 `just demo-restore` replays bundled fixtures (`FABLE_MONITOR_FIXTURES`) against a
 throwaway state file: the baseline run is silent, then the restored fixtures fire
@@ -115,25 +139,32 @@ stdout (schema `fable-monitor.event/1`):
 
 ```json
 {"schema":"fable-monitor.event/1","event_id":"model_present:claude-fable-5",
+ "occurrence_id":"occ-0123456789abcdef-1782396189000-initial",
+ "idempotency_key":"occ-0123456789abcdef-1782396189000-initial",
  "kind":"restoration","tier":1,"confidence":"high","escalation":false,
  "corroborating_sources":["anthropic_model_list","anthropic_pricing"],
  "detected_at":"2026-06-28T14:03:09Z","epoch_ms":1782396189000,
  "title":"Model claude-fable-5 present in public listing",
- "evidence_url":"https://docs.anthropic.com/...","document_number":"","detail":"claude-fable-5"}
+ "evidence_url":"https://platform.claude.com/docs/en/about-claude/models/overview","document_number":"",
+ "detail":"detector=2; hash=...; excerpt=claude-fable-5"}
 ```
 
-The event always goes to stdout; it is additionally appended to
-`FABLE_MONITOR_EVENT_SINK` and POSTed to `FABLE_MONITOR_WEBHOOK` when set. A
-downstream execution system consumes it in a separate process.
+The event is queued for stdout and, when configured, the event-sink file,
+webhook, and high-confidence notify hook. Every configured sink is required.
+Failures remain in state v5 and retry with bounded exponential backoff. A random
+lease token prevents a late worker from overwriting a newer claimant's result.
+Delivery
+is at least once across a crash; consumers must deduplicate on `occurrence_id`
+(also sent as `idempotency_key` and the webhook `Idempotency-Key` header).
 
 ## Run
 
     ./zig-out/bin/fable-monitor
 
 Diagnostics (and a one-line per-run metrics summary) go to stderr (prefixed
-`[fable-monitor]`); structured events and alerts go to stdout. On the first run
-every source records a baseline and reports no changes on subsequent runs until
-something actually shifts.
+`[fable-monitor]`); structured events and alerts go to stdout. On first run,
+transition/feed/watch sources establish baselines; current Federal Register
+documents are evaluated as new. Later runs stay quiet until something shifts.
 
 ### Environment variables
 
@@ -147,11 +178,22 @@ The most common (the full reference is in
 - `FABLE_MONITOR_WEBHOOK` / `FABLE_MONITOR_EVENT_SINK`: extra sinks for the
   structured event, beyond stdout.
 - `FABLE_MONITOR_HEARTBEAT_URL`: dead-man's-switch ping (healthchecks.io style),
-  so the monitor's own liveness is monitored.
+  sent only after a healthy run.
 - `FABLE_MONITOR_FAST_INTERVAL` / `FABLE_MONITOR_LOOP` / `FABLE_MONITOR_FORCE`:
   cadence controls.
+- `FABLE_MONITOR_REQUIRED_SOURCES`: comma-separated enabled decisive source IDs
+  that must remain fresh; `FABLE_MONITOR_MIN_DECISIVE_SOURCES` defaults to `1`.
+- `FABLE_MONITOR_LOOP_MAX_FAILURES`: consecutive loop failures before exit
+  (default `3`).
+- `FABLE_MONITOR_MAX_EVENTS`: newest observation rows retained by automatic
+  compaction (default `100000`).
 - `FABLE_MONITOR_ESCALATE_AFTER`: seconds before an unacknowledged
   high-confidence alert re-fires once (default 3600).
+
+Empty environment values are treated as unset. Boolean controls accept only
+`1` or `0`; interval, count, and port controls reject malformed or zero values.
+`ANTHROPIC_API_KEY` enables the authenticated API source but is never persisted
+by either installer.
 
 `FABLE_MONITOR_NOTIFY` is an optional shell command run on high-confidence trips
 and escalations. The alert text is passed as the positional parameter `$1`, so
@@ -201,9 +243,13 @@ TIME              SOURCE        EVENT              REF         INFO
 2026-06-18 15:30  bis_news      changed           ,           https://www.bis.gov/news-updates
 ```
 
-You can also read the raw log directly by decompressing:
-
-    zstd -dc fable_monitor_events.jsonl.zst | jq .
+The logical log can span `FABLE_MONITOR_LOG`, its `.manifest`,
+`.manifest.backup`, and `.segments/` directory. Use `log`, `view`, or `export`;
+decompressing only the legacy path can omit committed segments. If the primary
+manifest is missing or corrupt, reads may use its validated backup, but appends
+and compaction fail closed until `fable-monitor log recover` validates every
+referenced component and restores the primary. Run `fable-monitor log compact
+[max_events]` to force count-based retention.
 
 Or export to Parquet for analytical tools:
 
@@ -223,11 +269,11 @@ to the `zstd` binary. Schema, event kinds, and details are in
 
 ## Web UI
 
-A read-only browser dashboard over the same log and state the CLI reads — the
+A read-only browser dashboard over the same log and state the CLI reads, the
 poll status, configured sources, recent events, and any active alerts, with the
-tier-1 restoration signal front and centre. It is built with **htmx** and
-**Tailwind CSS v4**, both loaded from a CDN, so there is no front-end build step
-or `node_modules`; the Zig binary is the whole backend.
+tier-1 restoration signal front and centre. Its dependency-free JavaScript and
+CSS are vendored under `src/serve/` and embedded in the binary. It makes no CDN
+requests and needs no front-end build step or `node_modules`.
 
 Start it:
 
@@ -242,17 +288,18 @@ Start it:
 Then open **http://127.0.0.1:8787** (or your chosen port) in a browser.
 
 How it connects: the server binds **127.0.0.1 only** and serves the page shell at
-`/`. The browser-side htmx then polls small HTML fragment endpoints and swaps
-them into the page on an interval — no manual refresh:
+`/`. The local browser script polls small HTML fragment endpoints and swaps them
+into the page on an interval, with no manual refresh:
 
 | Endpoint | Refresh | Shows |
 |---|---|---|
-| `GET /` | — | The page shell (loads htmx + Tailwind v4 from CDN, so the machine viewing the UI needs internet for those two assets). |
+| `GET /` | — | The page shell; all executable/style assets are embedded locally. |
 | `GET /ui/status` | 5s | Stat cards: source count, events logged, active alerts, last observed time. |
 | `GET /ui/alerts` | 5s | Active (unacknowledged) alerts with tier, kind, and first-alerted time. |
 | `GET /ui/sources` | 30s | Every configured source with its tier, kind, poll class, and last success / change. |
 | `GET /ui/events?limit=N` | 10s | The most recent `N` events (default 30), newest first. |
 | `GET /healthz` | — | Plaintext `ok` for liveness checks. |
+| `GET /readyz` | — | `200 ready` only when state is readable, decisive coverage is fresh, and no delivery is overdue; otherwise `503`. |
 
 Which data it reads is controlled by the same `FABLE_MONITOR_LOG` and
 `FABLE_MONITOR_STATE` paths as every other command (see [Environment
@@ -263,6 +310,14 @@ alongside the scheduled poller that owns those files. It renders each request
 from a fresh arena and escapes all dynamic text. Because it binds loopback only,
 expose it beyond your machine with an SSH tunnel or a reverse proxy you control
 rather than changing the bind address.
+
+The same-origin article reader is **disabled by default**. Setting
+`FABLE_MONITOR_READER=1` enables on-demand fetching only for recorded public
+HTTPS URLs on recorded source hosts, port 443 only. It rejects credentials,
+private/literal special-use addresses, and redirects, caps responses at 16 MiB,
+and uses a 15-second curl timeout. Validated DNS answers are pinned into curl;
+accepted client sockets still lack request/header deadlines, so do not expose
+it as a general proxy.
 
 ## Banner
 
@@ -347,10 +402,13 @@ This README is the quick-start. Deeper technical documentation lives in
 - [`docs/sources.md`](docs/sources.md), the watched sources and how to add or tune one.
 - [`docs/state-format.md`](docs/state-format.md), the state file schema and lifecycle.
 - [`docs/data-export.md`](docs/data-export.md), the observation log and the `export` subcommand (NDJSON → Parquet).
-- [`docs/ui.md`](docs/ui.md), the `serve` subcommand: the read-only htmx + Tailwind v4 web dashboard and how the frontend connects.
+- [`docs/ui.md`](docs/ui.md), the `serve` subcommand: the read-only local-asset web dashboard and secure reader boundary.
 - [`docs/banner.md`](docs/banner.md), the `banner` subcommand (renders text with the bundled TrueType font).
 - [`docs/deployment.md`](docs/deployment.md), running under launchd/cron, env vars, and the notify hook.
 - [`docs/development.md`](docs/development.md), building, testing, and the documentation-maintenance policy.
+- [`docs/operations.md`](docs/operations.md), SLOs, backup/restore, incidents, and retention.
+- [`docs/security.md`](docs/security.md), trust boundaries and deployment/supply-chain controls.
+- [`docs/release.md`](docs/release.md), baseline-CPU releases, verification, and rollback.
 
 See [`docs/README.md`](docs/README.md) for the index and the policy that keeps
 these documents current.

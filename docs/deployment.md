@@ -1,6 +1,6 @@
 # Deployment
 
-Last reviewed: 2026-06-28 · against fable-monitor 0.1.0 (feat/tiered-monitor)
+Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
 
 `fable-monitor` does one poll per invocation and exits, so deployment means
 "have a scheduler run the binary on an interval." This document covers the
@@ -8,10 +8,19 @@ macOS launchd path, the Linux / Zo.computer path (systemd or cron via
 `dist/install-linux.sh`), the full environment-variable reference, the notify
 hook, and the dead-man's-switch heartbeat.
 
-Run `fable-monitor preflight` before scheduling: it checks the `curl`/`zstd`
-binaries, that the state path is writable, network egress to each enabled
-source, and whether the optional secrets (webhook / heartbeat / notify) are set.
-It prints one summary and returns an error on a hard failure.
+Run `fable-monitor preflight --json` before scheduling. It checks configuration,
+`curl`/`zstd`, writable state/log/outbox/event-sink paths, at least 10 MiB free
+on each relevant filesystem, source egress and response schema, and
+required/minimum decisive coverage. Webhook, heartbeat, and notify checks
+validate configuration but do not send test messages. JSON follows
+`fable-monitor.preflight/1`; failed checks set `ok:false` and exit 1.
+
+```json
+{"schema":"fable-monitor.preflight/1","ok":false,"checks":[{"name":"source_schema","category":"source_schema","status":"fail","source_id":"anthropic_model_list","detail":"unexpected response shape"}]}
+```
+
+Check names and human detail may grow; automation should gate on `schema`, `ok`,
+`category`, and `status`.
 
 ## Prerequisites
 
@@ -34,24 +43,39 @@ the new additions for the tiered monitor.
 |---|---|---|
 | `FABLE_MONITOR_STATE` | recommended | Absolute path to the compressed JSONL state file. Defaults to `fable_monitor_state.jsonl.zst` in the working directory. Always set it explicitly under a scheduler. See [state-format.md](state-format.md). |
 | `FABLE_MONITOR_LOG` | recommended | Absolute path to the observation log (compressed JSONL). Defaults to `fable_monitor_events.jsonl.zst`. It is the input to `export`. See [data-export.md](data-export.md). |
+| `FABLE_MONITOR_MAX_EVENTS` | optional | Positive event count retained by automatic log compaction. Defaults to `100000`. |
 | `FABLE_MONITOR_SOURCES` | optional | Path to an external JSON source config; replaces the embedded default. See [sources.md](sources.md). |
 | `FABLE_MONITOR_ONLY` | optional | Comma-separated source-id whitelist: if set, only these sources are enabled. |
 | `FABLE_MONITOR_DISABLE` | optional | Comma-separated source ids to force-disable (wins over `ONLY`). |
 | `FABLE_MONITOR_FIXTURES` | optional | Directory of fixture bodies; each source reads `<dir>/<source_id>` instead of the network (offline replay tests). Implies polling all sources. |
-| `FABLE_MONITOR_FORCE` | optional | If set, poll every enabled source regardless of cadence (ignore the due-check). |
+| `FABLE_MONITOR_FORCE` | optional | `1` polls every enabled source regardless of cadence; `0` disables the override. |
 | `FABLE_MONITOR_FAST_INTERVAL` | optional | Override the fast-loop cadence (seconds) for tier-1 sources; default 45 (from the config's `fast_interval_s`). |
 | `FABLE_MONITOR_LOOP` | optional | Run an internal loop polling every N seconds, for environments without a sub-minute scheduler. The in-binary due-cadence still gates per-tier work. |
+| `FABLE_MONITOR_LOOP_MAX_FAILURES` | optional | Positive consecutive failed/degraded loop ticks before the process exits for supervision; default 3. |
+| `FABLE_MONITOR_REQUIRED_SOURCES` | optional | Strict comma-separated enabled decisive source IDs. Every listed source must remain fresh; unknown, disabled, advisory, duplicate, or empty IDs are fatal configuration errors. |
+| `FABLE_MONITOR_MIN_DECISIVE_SOURCES` | optional | Positive minimum number of enabled decisive sources whose last success is fresh; default 1. Cannot exceed enabled decisive count. |
 | `FABLE_MONITOR_EVENT_SINK` | optional | Append each emitted structured event (one JSON line) to this file, in addition to stdout. |
 | `FABLE_MONITOR_WEBHOOK` | optional | POST each structured event to this URL, in addition to stdout. |
 | `FABLE_MONITOR_HEARTBEAT_URL` | optional | Dead-man's-switch ping target (healthchecks.io style); pinged after a clean run. |
 | `FABLE_MONITOR_ESCALATE_AFTER` | optional | Seconds before an unacknowledged high-confidence alert re-fires once; default 3600. |
 | `FABLE_MONITOR_NOTIFY` | optional | Shell command run on high-confidence trips and escalations. The alert text is passed as `$1` (injection-safe). |
-| `FABLE_MONITOR_METRICS` | optional | If set, also write per-source fetch metric rows (latency / HTTP status) to the observation log. |
-| `FABLE_MONITOR_STATS` | optional | If set, log a `getrusage` peak-RSS/CPU summary (process + curl/zstd children) to stderr at the end of each run, and enable metric rows. See [development.md](development.md) → Resource usage. |
+| `ANTHROPIC_API_KEY` | optional | Enables the authenticated `api_probe`; required in practice if that source is listed in `FABLE_MONITOR_REQUIRED_SOURCES`. |
+| `FABLE_MONITOR_PORT` | optional | UI port when no positional `serve <port>` is supplied; default 8787. |
+| `FABLE_MONITOR_READER` | optional | Set exactly `1` to enable the same-origin article reader. Disabled by default. See [ui.md](ui.md). |
+| `FABLE_MONITOR_METRICS` | optional | `1` also writes per-source fetch metric rows; `0` disables them. |
+| `FABLE_MONITOR_STATS` | optional | `1` logs a `getrusage` peak-RSS/CPU summary and enables metric rows; `0` disables it. See [development.md](development.md) → Resource usage. |
 
 Each run also prints a one-line metrics summary to stderr regardless of the
 above (counts of ok / not-modified / failed sources, total fetch ms, total
-wall-clock ms).
+wall-clock ms), followed by a stable key/value outcome line containing due/ok/
+failed/decisive counts, pending/failed delivery counts, audit/state persistence,
+delivery, and heartbeat status.
+
+Empty values are equivalent to unset. Boolean variables accept exactly `1` or
+`0`. Positive intervals/counts and ports reject zero and malformed values. The
+installers omit unset optional values and do not persist `ANTHROPIC_API_KEY`.
+Thus `NAME=` selects the documented default or disables that optional feature;
+it is not an explicitly configured empty path, URL, key, list, number, or flag.
 
 ### Structured events (the integration point)
 
@@ -61,15 +85,42 @@ additionally appends it to `FABLE_MONITOR_EVENT_SINK` and POSTs it to
 
 ```json
 {"schema":"fable-monitor.event/1","event_id":"model_present:claude-fable-5",
+ "occurrence_id":"occ-0123456789abcdef-1782396189000-initial",
+ "idempotency_key":"occ-0123456789abcdef-1782396189000-initial",
  "kind":"restoration","tier":1,"confidence":"high","escalation":false,
  "corroborating_sources":["anthropic_model_list","anthropic_pricing"],
  "detected_at":"2026-06-28T14:03:09Z","epoch_ms":1782396189000,
  "title":"Model claude-fable-5 present in public listing",
- "evidence_url":"https://docs.anthropic.com/...","document_number":"","detail":"claude-fable-5"}
+ "evidence_url":"https://platform.claude.com/docs/en/about-claude/models/overview","document_number":"",
+ "detail":"detector=2; hash=...; excerpt=claude-fable-5"}
 ```
 
-A downstream trading/execution system consumes this event in a separate process;
-the monitor's responsibility ends at emitting the verified signal.
+Detection is appended to the observation log first, then immutable payloads are
+committed to the state-v5 outbox before delivery. Stdout plus every configured event-file/webhook/notify sink is
+required. Sink failures remain pending and retry with bounded exponential
+backoff; `delivery list` and `delivery retry [event_id|occurrence_id]` are the
+operator controls. Delivery is at least once across crashes. Webhooks receive
+the occurrence as `Idempotency-Key`; every consumer must deduplicate on it.
+Random lease tokens fence completion so a late expired claimant cannot overwrite
+a newer claimant's result.
+
+Source polls are HTTPS-only and never follow redirects, including public probes;
+a 3xx degrades/fails coverage according to the normal source policy. Webhook and
+heartbeat requests likewise do not follow redirects.
+
+### Outcomes and probes
+
+- `healthy`: required/minimum decisive observations are fresh (no older than two
+  configured source intervals), no source failed, persistence and delivery
+  completed, and any configured heartbeat succeeded. Exit zero.
+- `degraded`: decisive coverage remains healthy, but a source or heartbeat
+  failed. Exit nonzero (`PollDegraded`); no success heartbeat is sent after a
+  source-degraded classification.
+- `failed`: decisive coverage is insufficient, state/log commit fails, or a
+  delivery backlog remains. Exit nonzero (`PollFailed`).
+- `GET /healthz`: liveness only; always `200 ok` while `serve` can answer.
+- `GET /readyz`: readiness; `503` for unreadable state, stale required/minimum
+  decisive coverage, or a due and unleased delivery backlog.
 
 ### The dead-man's switch (heartbeat)
 
@@ -82,11 +133,12 @@ is quietly failing while the run as a whole still succeeds.
 
 ### Acknowledging and escalation
 
-A fired high-confidence alert is recorded once per event identity and does not
+A fired high-confidence alert is recorded once per active subject episode and does not
 re-fire as the change persists. If it remains unacknowledged for
 `FABLE_MONITOR_ESCALATE_AFTER` seconds (default 3600) it re-fires exactly once.
-Acknowledge it with `fable-monitor ack <event_id>` (the `event_id` from the
-structured event) to stop the escalation.
+Acknowledge it with `fable-monitor ack <event_id>` to stop escalation. A model or
+statement subject can re-arm after a successful absence observation and then
+produce a new `occurrence_id`; failed fetches never establish absence.
 
 ### The notify hook
 
@@ -178,12 +230,14 @@ effect. Validate edits with `plutil -lint <file>`.
 `dist/install-linux.sh` installs a recurring job on a Linux host (the
 Zo.computer deployment target included), parameterized by scheduler. It:
 
-1. builds a `ReleaseSafe` binary;
+1. builds a baseline-CPU `ReleaseSafe` binary, or verifies and installs the
+   archive selected by `FABLE_MONITOR_ARTIFACT` and
+   `FABLE_MONITOR_ARTIFACT_SHA256`;
 2. stages the binary and durable state under `FABLE_HOME`
    (default `~/.local/share/fable-monitor`);
 3. writes a `0600` env file (`fable-monitor.env`) under `FABLE_HOME`, sourcing
    the secrets from the environment **at install time** (nothing is committed);
-4. runs `fable-monitor preflight`;
+4. runs `fable-monitor preflight` and aborts on failure;
 5. registers the job: a systemd **user timer** firing every
    `FABLE_FAST_INTERVAL` seconds, or a crontab entry.
 
@@ -231,6 +285,11 @@ The env file the installer writes sets `FABLE_MONITOR_STATE`,
 `FABLE_MONITOR_LOG`, `FABLE_MONITOR_FAST_INTERVAL`, and (when present in the
 install-time environment) `FABLE_MONITOR_WEBHOOK`, `FABLE_MONITOR_HEARTBEAT_URL`,
 `FABLE_MONITOR_EVENT_SINK`, `FABLE_MONITOR_NOTIFY`, and `FABLE_MONITOR_SOURCES`.
+It does not currently forward required-source/minimum-coverage, API-key, reader,
+or loop variables; for those, use a reviewed service override or wrapper and run
+`preflight` in that exact environment. The installer uses `umask 077`, a mode
+`0700` durable directory, and mode `0600` environment/unit files. Local `.env`
+files must also be mode `0600`; `.env.example` shows the setup command.
 Provide the secrets in your shell before running the installer, e.g.:
 
 ```sh
@@ -240,23 +299,25 @@ export FABLE_MONITOR_NOTIFY='curl -fsS -X POST -d "text=$1" https://example.com/
 FABLE_HOME=/persistent/fable-monitor bash dist/install-linux.sh
 ```
 
-### Zo.computer user services (the live deployment)
+### Zo.computer user services (reference deployment)
 
-The reference deployment on Zo does not use `install-linux.sh`; it uses Zo's
+The reference topology on Zo does not use `install-linux.sh`; it uses Zo's
 own **user services** (a supervisord-managed process manager), which is simpler
 than provisioning systemd inside the sandbox and gets automatic restarts. Two
 services back the running instance:
 
-- **`fable-monitor-poller`** (mode `process`) — runs a wrapper that exports the
+- **`fable-monitor-poller`** (mode `process`) runs a wrapper that exports the
   state/log paths plus `FABLE_MONITOR_LOOP=1800`, then `exec`s the binary. The
   in-binary loop (see [Environment variables](#environment-variables)) polls
   every 30 min, so no external scheduler is needed.
-- **`fable-monitor-ui`** (mode `http`, port 8787) — the read-only dashboard
+- **`fable-monitor-ui`** (mode `http`, operator-chosen non-default port) is the read-only dashboard
   (`serve`; see [ui.md](ui.md)). It is kept **private**: reachable only at its
   `*.zo.computer` URL while signed in to Zo, never exposed publicly.
 
 Repo at `~/fable_monitor`; durable state at
-`~/fable-monitor-data/{state,events}.jsonl.zst`.
+`~/fable-monitor-data/{state,events}.jsonl.zst`; the selected UI port is stored
+in `~/fable-monitor-data/ui-port.txt`. See the root `ZO-DEPLOY-RUNBOOK.md` for
+the current wrappers and verification procedure.
 
 **Build for a baseline CPU.** Build with:
 
@@ -272,17 +333,16 @@ to the target triple is rejected as `InvalidAbiVersion` — use the separate
 `-Dcpu` flag.) `zstd` is not preinstalled on Zo (`apt-get install -y zstd`);
 `zig`, `git`, and `curl` are.
 
-**Notifications via a Zo automation.** The poller sets
+**Optional notifications via a Zo automation.** A deployment may set
 
 ```sh
 export FABLE_MONITOR_NOTIFY='printf "%s\n" "$1" >> ~/fable-monitor-data/pending-alerts.ndjson'
 ```
 
-so every tier-1 trip/escalation appends its alert line to a pending file. A Zo
-automation runs every ~15 min; when that file is non-empty it moves it aside
-atomically, emails the alert(s) to the account owner, and removes it. This
-decouples the always-on poller (which only writes the file) from delivery
-(which Zo handles), and is idempotent — an empty file sends nothing.
+The state-v5 outbox then treats this notify command as a required sink and
+retries a nonzero command exit. A separate Zo automation may drain and email the
+file, but that external setup and its end-to-end idempotency are not implemented
+or verified by this repository. Record its owner and test evidence separately.
 
 ### Manual cron / reference
 
@@ -293,14 +353,20 @@ explicitly).
 
 ## Operating notes
 
+The production SLOs, backup/restore process, incident response, retention, and
+rollback procedures are in [operations.md](operations.md). The trust boundary
+and secret-handling model are in [security.md](security.md).
+
 - **Logs are the dashboard.** stdout carries alerts; stderr carries
   `[fable-monitor]`-prefixed diagnostics. A persistently failing source only
   shows up in stderr (see error isolation in
   [design-decisions.md](design-decisions.md)), so watch the error log.
-- **First run is noisy by design**, it baselines everything. Subsequent runs
-  are quiet until something actually changes.
+- **First run establishes transition/feed/watch baselines and evaluates current
+  Federal Register documents as new.** Subsequent runs are quiet until something
+  changes.
 - **State is the source of truth for "what's new."** Don't delete it in
-  production unless you intend to re-baseline (which will re-alert everything).
+  production unless you intend to re-baseline and reevaluate current Federal
+  Register history.
 
 ## When you change deployment, update the docs
 
