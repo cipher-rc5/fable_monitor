@@ -1,6 +1,6 @@
 # Sources
 
-Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
+Last reviewed: 2026-07-15 · against fable-monitor 0.1.0
 
 A *source* is one thing the monitor polls. Sources are **no longer hard-coded**:
 they are described by a JSON config document, loaded at runtime by
@@ -153,7 +153,9 @@ the expected source count and origin. `fable-monitor preflight --json` then
 checks egress and response shape for each enabled source. To edit the *defaults*, change
 `src/sources_default.json` and rebuild. For automation, `preflight --json`
 returns `fable-monitor.preflight/1` checks with stable categories for egress,
-schema, and decisive coverage.
+schema, and decisive coverage. The `/1` suffix is a stable major version; see
+[data-export.md](data-export.md) → Schema versioning and compatibility for how
+the JSON contracts are versioned and deprecated.
 
 ## The detection vocabularies
 

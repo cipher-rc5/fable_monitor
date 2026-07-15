@@ -442,6 +442,96 @@ test "glyph F decodes to a non-empty outline" {
     try testing.expect(edges.items.len > 0);
 }
 
+/// Reproduce the exact fit/scale/flip pipeline `render` applies to `edges`
+/// (see `pub fn render`), returning the rasterized `w`×`h` ink bitmap. Kept in
+/// sync with `render` so the golden test below exercises the real path without
+/// touching stdout. `want_h` is the requested pixel height (already clamped by
+/// the caller here to a small fixed value).
+fn rasterizeForTest(a: Allocator, text: []const u8, want_h: f64, out_w: *usize, out_h: *usize) ![]bool {
+    const f = try Font.load(font_ttf);
+    const edges = try layout(f, a, text);
+
+    var min_x: f64 = std.math.floatMax(f64);
+    var min_y: f64 = std.math.floatMax(f64);
+    var max_x: f64 = -std.math.floatMax(f64);
+    var max_y: f64 = -std.math.floatMax(f64);
+    for (edges.items) |e| {
+        min_x = @min(min_x, @min(e.x0, e.x1));
+        min_y = @min(min_y, @min(e.y0, e.y1));
+        max_x = @max(max_x, @max(e.x0, e.x1));
+        max_y = @max(max_y, @max(e.y0, e.y1));
+    }
+    const span_x = max_x - min_x;
+    const span_y = max_y - min_y;
+    const scale = @min(want_h / span_y, @as(f64, @floatFromInt(max_width)) / span_x);
+    const w: usize = @max(1, @as(usize, @intFromFloat(@ceil(span_x * scale))));
+    const h: usize = @max(1, @as(usize, @intFromFloat(@ceil(span_y * scale))));
+    for (edges.items) |*e| {
+        e.x0 = (e.x0 - min_x) * scale;
+        e.x1 = (e.x1 - min_x) * scale;
+        e.y0 = (max_y - e.y0) * scale;
+        e.y1 = (max_y - e.y1) * scale;
+    }
+    out_w.* = w;
+    out_h.* = h;
+    return rasterize(a, edges.items, w, h);
+}
+
+test "golden render: glyph F at height 8 is stable and draws ink" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var w: usize = 0;
+    var h: usize = 0;
+    // Height 8 pixel rows → a small, deterministic bitmap.
+    const bmp = try rasterizeForTest(a, "F", 8, &w, &h);
+
+    // Dimensions are deterministic for the embedded font at this fixed height.
+    try testing.expectEqual(@as(usize, 7), w);
+    try testing.expectEqual(@as(usize, 8), h);
+    try testing.expectEqual(w * h, bmp.len);
+
+    // It actually drew something (some, but not all, cells are ink).
+    var ink: usize = 0;
+    for (bmp) |b| {
+        if (b) ink += 1;
+    }
+    try testing.expect(ink > 0);
+    try testing.expect(ink < bmp.len);
+    try testing.expectEqual(@as(usize, 16), ink);
+
+    // Pin the exact bitmap: same embedded font ⇒ same bytes every run.
+    var hasher = std.hash.Wyhash.init(0);
+    for (bmp) |b| hasher.update(&[_]u8{if (b) 1 else 0});
+    try testing.expectEqual(@as(u64, 0xb6c45df819a6e2a0), hasher.final());
+
+    // Emit half-block rows exactly as `render` does, and assert the output uses
+    // only the expected glyph set: space plus ▀ (U+2580), ▄ (U+2584), █ (U+2588).
+    var used_upper = false; // ▀
+    var used_lower = false; // ▄
+    var used_full = false; // █
+    var ry: usize = 0;
+    while (ry < h) : (ry += 2) {
+        var c: usize = 0;
+        while (c < w) : (c += 1) {
+            const top = bmp[ry * w + c];
+            const bot = ry + 1 < h and bmp[(ry + 1) * w + c];
+            const glyph: []const u8 = if (top and bot) "\u{2588}" else if (top) "\u{2580}" else if (bot) "\u{2584}" else " ";
+            if (std.mem.eql(u8, glyph, "\u{2580}")) used_upper = true;
+            if (std.mem.eql(u8, glyph, "\u{2584}")) used_lower = true;
+            if (std.mem.eql(u8, glyph, "\u{2588}")) used_full = true;
+            // charset subset: every cell is one of the four allowed glyphs.
+            try testing.expect(std.mem.eql(u8, glyph, " ") or
+                std.mem.eql(u8, glyph, "\u{2580}") or
+                std.mem.eql(u8, glyph, "\u{2584}") or
+                std.mem.eql(u8, glyph, "\u{2588}"));
+        }
+    }
+    // "F" at this size uses at least one non-space half-block.
+    try testing.expect(used_upper or used_lower or used_full);
+}
+
 test "quadratic flatten emits bezier_steps segments ending at the endpoint" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

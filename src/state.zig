@@ -364,9 +364,13 @@ pub fn parseDiagnostic(arena: std.mem.Allocator, data: []const u8, diagnostic: *
         line_number += 1;
         const t = std.mem.trim(u8, line, " \r\t");
         if (t.len == 0) continue;
-        const parsed = std.json.parseFromSlice(StateRecord, arena, t, .{ .ignore_unknown_fields = true }) catch
+        // Leaky parse into the caller's arena: parseFromSlice would wrap each
+        // record in its own owned ArenaAllocator that this code never deinits,
+        // stranding that arena until the caller's arena is torn down (and, under
+        // a partial allocation failure, leaking it). The caller's arena owns the
+        // record's lifetime, so parse directly into it.
+        const r = std.json.parseFromSliceLeaky(StateRecord, arena, t, .{ .ignore_unknown_fields = true }) catch
             return parseFailure(diagnostic, line_number, .malformed_json, error.MalformedState);
-        const r = parsed.value;
         if (std.mem.eql(u8, r.kind, "meta")) {
             if (record_count != 0 or meta_seen) return parseFailure(diagnostic, line_number, .invalid_order, error.MalformedState);
             if (r.version == 0) return parseFailure(diagnostic, line_number, .invalid_field, error.MalformedState);

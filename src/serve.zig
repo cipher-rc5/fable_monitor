@@ -52,8 +52,10 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
     };
     log("UI listening on http://127.0.0.1:{d}  (Ctrl-C to stop)", .{port});
 
-    // Deliberately bounded to one active request. Cache mutation is single-owner,
-    // and the Zig 0.16 net.Stream API has no accepted-socket deadline setter.
+    // Deliberately bounded to one active request. Cache mutation is single-owner.
+    // A stalled client cannot hold the one request slot forever: each accepted
+    // socket is given a bounded receive/send timeout via SO_RCVTIMEO/SO_SNDTIMEO
+    // (see applySocketTimeouts) before the request is read.
     var cache = Cache.init(std.heap.page_allocator);
     defer cache.deinit();
 
@@ -72,6 +74,11 @@ pub fn run(ctx: *Context, load_opts: config.LoadOptions, port: u16) !void {
 /// localhost dashboard, where the browser opens a fresh connection per poll.
 fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, stream: net.Stream) !void {
     defer stream.close(ctx.io);
+
+    // Bound how long a single slow/stalled client can occupy the one request
+    // slot. Without this a client that opens a connection and never finishes
+    // sending the request head would block the accept loop indefinitely.
+    applySocketTimeouts(stream.socket.handle);
 
     var rbuf: [16 * 1024]u8 = undefined;
     var wbuf: [64 * 1024]u8 = undefined;
@@ -159,6 +166,31 @@ fn handleConn(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache, strea
     }
 }
 
+/// Per-request read/write deadline for an accepted socket. A localhost
+/// dashboard handles one connection at a time (`Connection: close`), so a
+/// client that connects and then stalls mid-request would otherwise pin the
+/// single request slot forever. `SO_RCVTIMEO`/`SO_SNDTIMEO` make a stalled
+/// `recv`/`send` fail with `Timeout` after the bound, freeing the loop.
+///
+/// Best-effort: on a platform (or via a runtime) that does not accept these
+/// options the call is logged and ignored rather than crashing — the loop
+/// simply degrades to its prior no-deadline behavior for that connection.
+fn applySocketTimeouts(handle: net.Socket.Handle) void {
+    const tv = std.posix.timeval{ .sec = socket_timeout_s, .usec = 0 };
+    const opt = std.mem.asBytes(&tv);
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, opt) catch |e| {
+        log("serve: could not set receive timeout on socket: {s}", .{@errorName(e)});
+    };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, opt) catch |e| {
+        log("serve: could not set send timeout on socket: {s}", .{@errorName(e)});
+    };
+}
+
+/// Bounded per-request receive/send deadline in seconds (see
+/// `applySocketTimeouts`). Ten seconds is generous for a same-host browser
+/// poll while still capping a stalled peer.
+const socket_timeout_s: isize = 10;
+
 const Readiness = struct { ready: bool, message: []const u8 };
 
 fn readiness(ctx: *Context, load_opts: config.LoadOptions) Readiness {
@@ -228,7 +260,7 @@ fn renderStatus(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![]
     try card(a, &out, "Pending delivery", try std.fmt.allocPrint(a, "{d}", .{pending}), if (pending > 0) "text-rose-400" else "text-emerald-400");
     const failed = failedDeliveries(st);
     try card(a, &out, "Failed delivery", try std.fmt.allocPrint(a, "{d}", .{failed}), if (failed > 0) "text-rose-400" else "text-emerald-400");
-    try card(a, &out, "Last observed", esc(a, last_obs), "text-slate-200");
+    try card(a, &out, "Last observed", try esc(a, last_obs), "text-slate-200");
     try out.appendSlice(a, "</div>");
     return out.items;
 }
@@ -246,12 +278,12 @@ fn renderSources(ctx: *Context, load_opts: config.LoadOptions, cache: *Cache) ![
         const last_chg = if (status) |ss| try msToIso(ctx, ss.last_change_ms) else "—";
         try out.appendSlice(a, "<tr class=\"border-t border-slate-800 hover:bg-slate-800/40\">");
         try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2\">{s}</td>", .{tierBadge(s.tier.int())}));
-        try td(a, &out, esc(a, s.id), "font-mono text-xs text-slate-400");
-        try td(a, &out, esc(a, s.label), "text-slate-200");
-        try td(a, &out, esc(a, s.kind.logName()), "text-slate-400");
+        try td(a, &out, try esc(a, s.id), "font-mono text-xs text-slate-400");
+        try td(a, &out, try esc(a, s.label), "text-slate-200");
+        try td(a, &out, try esc(a, s.kind.logName()), "text-slate-400");
         try td(a, &out, @tagName(s.poll), "text-slate-400");
-        try td(a, &out, esc(a, last_ok), "text-slate-400 text-xs");
-        try td(a, &out, esc(a, last_chg), "text-slate-400 text-xs");
+        try td(a, &out, try esc(a, last_ok), "text-slate-400 text-xs");
+        try td(a, &out, try esc(a, last_chg), "text-slate-400 text-xs");
         try out.appendSlice(a, "</tr>");
     }
     try out.appendSlice(a, "</tbody></table>");
@@ -273,11 +305,11 @@ fn renderEvents(ctx: *Context, cache: *Cache, target: []const u8) ![]const u8 {
         const e = rows[i];
         const detail = if (e.title.len > 0) e.title else if (e.document_number.len > 0) e.document_number else e.detail;
         try out.appendSlice(a, "<tr class=\"border-t border-slate-800 hover:bg-slate-800/40\">");
-        try td(a, &out, esc(a, e.observed_at), "text-slate-400 text-xs whitespace-nowrap");
+        try td(a, &out, try esc(a, e.observed_at), "text-slate-400 text-xs whitespace-nowrap");
         try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2\">{s}</td>", .{tierBadge(e.tier)}));
-        try td(a, &out, esc(a, e.source_id), "font-mono text-xs text-slate-400");
+        try td(a, &out, try esc(a, e.source_id), "font-mono text-xs text-slate-400");
         try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2\">{s}</td>", .{eventBadge(a, e.event)}));
-        try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2 text-slate-200\">{s}</td>", .{detailCell(a, esc(a, detail), e.url)}));
+        try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2 text-slate-200\">{s}</td>", .{detailCell(a, try esc(a, detail), e.url)}));
         try out.appendSlice(a, "</tr>");
     }
     if (rows.len == 0) {
@@ -304,9 +336,9 @@ fn renderAlerts(ctx: *Context, cache: *Cache) ![]const u8 {
             "<span class=\"rounded bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300\">active</span>";
         try out.appendSlice(a, "<tr class=\"border-t border-slate-800 hover:bg-slate-800/40\">");
         try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2\">{s}</td>", .{tierBadge(al.tier)}));
-        try td(a, &out, esc(a, al.ev_kind), "text-slate-400");
-        try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2 text-slate-200\">{s}</td>", .{detailCell(a, esc(a, al.title), al.url)}));
-        try td(a, &out, esc(a, try msToIso(ctx, al.epoch_ms)), "text-slate-400 text-xs");
+        try td(a, &out, try esc(a, al.ev_kind), "text-slate-400");
+        try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2 text-slate-200\">{s}</td>", .{detailCell(a, try esc(a, al.title), al.url)}));
+        try td(a, &out, try esc(a, try msToIso(ctx, al.epoch_ms)), "text-slate-400 text-xs");
         try out.appendSlice(a, try std.fmt.allocPrint(a, "<td class=\"px-3 py-2\">{s}</td>", .{badge}));
         try out.appendSlice(a, "</tr>");
     }
@@ -352,7 +384,7 @@ fn renderSearchIndex(ctx: *Context, cache: *Cache) ![]const u8 {
         try out.appendSlice(a, try std.fmt.allocPrint(
             a,
             "{{\"t\":\"event\",\"title\":{s},\"source\":{s},\"tier\":{d},\"kind\":{s},\"event\":{s},\"url\":{s},\"when\":{s},\"ts\":{d},\"detail\":{s}}}",
-            .{ jsonStr(a, title), jsonStr(a, src), e.tier, jsonStr(a, e.event), jsonStr(a, e.event), jsonStr(a, e.url), jsonStr(a, e.observed_at), e.epoch_ms, jsonStr(a, e.detail) },
+            .{ try jsonStr(a, title), try jsonStr(a, src), e.tier, try jsonStr(a, e.event), try jsonStr(a, e.event), try jsonStr(a, e.url), try jsonStr(a, e.observed_at), e.epoch_ms, try jsonStr(a, e.detail) },
         ));
     }
 
@@ -370,7 +402,7 @@ fn renderSearchIndex(ctx: *Context, cache: *Cache) ![]const u8 {
         try out.appendSlice(a, try std.fmt.allocPrint(
             a,
             "{{\"t\":\"alert\",\"title\":{s},\"source\":{s},\"tier\":{d},\"kind\":\"alert\",\"event\":{s},\"url\":{s},\"when\":{s},\"ts\":{d},\"detail\":{s}}}",
-            .{ jsonStr(a, al.title), jsonStr(a, al.ev_kind), al.tier, jsonStr(a, status), jsonStr(a, al.url), jsonStr(a, when), al.epoch_ms, jsonStr(a, status) },
+            .{ try jsonStr(a, al.title), try jsonStr(a, al.ev_kind), al.tier, try jsonStr(a, status), try jsonStr(a, al.url), try jsonStr(a, when), al.epoch_ms, try jsonStr(a, status) },
         ));
     }
 
@@ -380,22 +412,22 @@ fn renderSearchIndex(ctx: *Context, cache: *Cache) ![]const u8 {
 
 /// Quote and escape a string as a JSON string literal (including surrounding
 /// double quotes). Control characters below 0x20 are emitted as \uXXXX.
-fn jsonStr(a: Allocator, s: []const u8) []const u8 {
+fn jsonStr(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    out.append(a, '"') catch {};
+    try out.append(a, '"');
     for (s) |c| switch (c) {
-        '"' => out.appendSlice(a, "\\\"") catch {},
-        '\\' => out.appendSlice(a, "\\\\") catch {},
-        '\n' => out.appendSlice(a, "\\n") catch {},
-        '\r' => out.appendSlice(a, "\\r") catch {},
-        '\t' => out.appendSlice(a, "\\t") catch {},
+        '"' => try out.appendSlice(a, "\\\""),
+        '\\' => try out.appendSlice(a, "\\\\"),
+        '\n' => try out.appendSlice(a, "\\n"),
+        '\r' => try out.appendSlice(a, "\\r"),
+        '\t' => try out.appendSlice(a, "\\t"),
         else => if (c < 0x20) {
-            out.appendSlice(a, std.fmt.allocPrint(a, "\\u{x:0>4}", .{c}) catch "") catch {};
+            try out.appendSlice(a, try std.fmt.allocPrint(a, "\\u{x:0>4}", .{c}));
         } else {
-            out.append(a, c) catch {};
+            try out.append(a, c);
         },
     };
-    out.append(a, '"') catch {};
+    try out.append(a, '"');
     return out.items;
 }
 
@@ -568,7 +600,7 @@ fn card(a: Allocator, out: *std.ArrayList(u8), label: []const u8, value: []const
         \\<div class="rounded-lg border border-slate-800 bg-slate-900/60 p-4">
         \\<div class="text-xs uppercase tracking-wide text-slate-500">{s}</div>
         \\<div class="mt-1 text-2xl font-semibold {s}">{s}</div></div>
-    , .{ esc(a, label), accent, value }));
+    , .{ try esc(a, label), accent, value }));
 }
 
 fn tableHead(a: Allocator, out: *std.ArrayList(u8), headers: []const []const u8) !void {
@@ -591,9 +623,10 @@ fn detailCell(a: Allocator, text: []const u8, url: []const u8) []const u8 {
     // tokens, javascript:/data:/file:, …) is rendered as escaped plain text so a
     // hostile URL in the log can never become a live link.
     if (!urlSchemeAllowed(url)) {
-        return std.fmt.allocPrint(a, "{s} <span class=\"text-slate-500 text-xs\">{s}</span>", .{ text, esc(a, url) }) catch text;
+        const escaped_url = esc(a, url) catch return text;
+        return std.fmt.allocPrint(a, "{s} <span class=\"text-slate-500 text-xs\">{s}</span>", .{ text, escaped_url }) catch text;
     }
-    const u = esc(a, url);
+    const u = esc(a, url) catch return text;
     return std.fmt.allocPrint(
         a,
         "<a href=\"{s}\" data-reader-url=\"{s}\" data-reader-label=\"{s}\" class=\"reader-link text-sky-400 hover:underline\">{s}</a>" ++
@@ -626,18 +659,19 @@ fn eventBadge(a: Allocator, kind: []const u8) []const u8 {
         return "<span class=\"rounded bg-sky-500/20 px-2 py-0.5 text-xs text-sky-300\">advisory</span>";
     if (eql(kind, events.ev_baseline))
         return "<span class=\"rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-400\">baseline</span>";
-    return std.fmt.allocPrint(a, "<span class=\"text-slate-400 text-xs\">{s}</span>", .{esc(a, kind)}) catch kind;
+    const escaped_kind = esc(a, kind) catch return kind;
+    return std.fmt.allocPrint(a, "<span class=\"text-slate-400 text-xs\">{s}</span>", .{escaped_kind}) catch kind;
 }
 
-fn esc(a: Allocator, s: []const u8) []const u8 {
+fn esc(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (s) |c| switch (c) {
-        '&' => out.appendSlice(a, "&amp;") catch {},
-        '<' => out.appendSlice(a, "&lt;") catch {},
-        '>' => out.appendSlice(a, "&gt;") catch {},
-        '"' => out.appendSlice(a, "&quot;") catch {},
-        '\'' => out.appendSlice(a, "&#39;") catch {},
-        else => out.append(a, c) catch {},
+        '&' => try out.appendSlice(a, "&amp;"),
+        '<' => try out.appendSlice(a, "&lt;"),
+        '>' => try out.appendSlice(a, "&gt;"),
+        '"' => try out.appendSlice(a, "&quot;"),
+        '\'' => try out.appendSlice(a, "&#39;"),
+        else => try out.append(a, c),
     };
     return out.items;
 }
@@ -873,11 +907,12 @@ fn readerWorkerDocument(ctx: *Context, url: []const u8) []const u8 {
 }
 
 fn readerPending(a: Allocator, target: []const u8) []const u8 {
+    const escaped_target = esc(a, target) catch return readerError(a, "reader is loading; retry shortly.");
     return std.fmt.allocPrint(
         a,
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"1;url={s}\"></head>" ++
             "<body style=\"margin:0;height:100vh;background:#000;color:#fff;display:grid;place-items:center;font:13px monospace\">loading secure reader...</body></html>",
-        .{esc(a, target)},
+        .{escaped_target},
     ) catch readerError(a, "reader is loading; retry shortly.");
 }
 
@@ -1004,7 +1039,7 @@ fn urlAllowed(ctx: *Context, cache: *Cache, url: []const u8) bool {
 /// Inject a `<base>` so the fetched page's relative assets/links resolve against
 /// its real origin (and in-frame navigation stays in the drawer).
 fn injectBase(a: Allocator, html: []const u8, url: []const u8) ![]const u8 {
-    const base_tag = try std.fmt.allocPrint(a, "<base href=\"{s}\" target=\"_self\">", .{esc(a, url)});
+    const base_tag = try std.fmt.allocPrint(a, "<base href=\"{s}\" target=\"_self\">", .{try esc(a, url)});
     if (std.ascii.indexOfIgnoreCase(html, "<head")) |h| {
         if (std.mem.indexOfScalarPos(u8, html, h, '>')) |gt| {
             var out: std.ArrayList(u8) = .empty;
@@ -1019,13 +1054,14 @@ fn injectBase(a: Allocator, html: []const u8, url: []const u8) ![]const u8 {
 
 /// A minimal, on-theme HTML page shown inside the reader iframe on any failure.
 fn readerError(a: Allocator, msg: []const u8) []const u8 {
+    const escaped_msg = esc(a, msg) catch return "<p>reader error</p>";
     return std.fmt.allocPrint(
         a,
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{margin:0;height:100%;background:#000;color:#fff;" ++
             "font-family:'Roboto Mono',ui-monospace,monospace;display:flex;align-items:center;justify-content:center;}}" ++
             "p{{padding:24px;font-size:13px;letter-spacing:.02em;color:#e8e8e8;text-align:center;max-width:520px;line-height:1.7;}}" ++
             "</style></head><body><p>{s}</p></body></html>",
-        .{esc(a, msg)},
+        .{escaped_msg},
     ) catch "<p>reader error</p>";
 }
 
@@ -1372,6 +1408,28 @@ test "detailCell allowlists http/https and renders other schemes as text" {
 
     // No URL: text passes through untouched.
     try std.testing.expectEqualStrings("t", detailCell(a, "t", ""));
+}
+
+test "esc and jsonStr surface OOM instead of truncating output" {
+    // On a healthy allocator both escape helpers produce complete output.
+    {
+        var ta = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer ta.deinit();
+        const a = ta.allocator();
+        try std.testing.expectEqualStrings("a&lt;b&gt;", try esc(a, "a<b>"));
+        try std.testing.expectEqualStrings("\"a\\\"b\"", try jsonStr(a, "a\"b"));
+    }
+
+    // When an allocation fails mid-escape the helpers must return
+    // error.OutOfMemory rather than a silently truncated (half-escaped)
+    // string. Fail on the first allocation so no partial buffer can be
+    // handed back as if it were the finished, safe output.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        const a = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, esc(a, "needs <escaping>"));
+        try std.testing.expectError(error.OutOfMemory, jsonStr(a, "needs \"escaping\""));
+    }
 }
 
 test "reader URL gate requires public HTTPS without credentials or unusual ports" {

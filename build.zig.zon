@@ -1,6 +1,8 @@
 .{
     .name = .fable_monitor,
     .version = "0.1.0",
+    // Canonical source repository (provenance).
+    .repository = "https://github.com/cipher-rc5/fable_monitor",
     .fingerprint = 0x377dcb1ba8dbf13a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

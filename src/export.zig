@@ -130,3 +130,169 @@ fn exportState(ctx: *Context, out_dir: []const u8) !void {
         log("wrote {s} ({d} rows)", .{ path, rows.items.len });
     }
 }
+
+// --- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Read a whole file under the cwd into the arena; small helper for assertions.
+fn readWhole(io: Io, a: Allocator, path: []const u8) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 * 1024 * 1024));
+}
+
+/// A Parquet file is framed by the "PAR1" magic at both ends. Assert the file
+/// exists, is non-trivial, and carries the magic in both positions.
+fn expectParquetFile(io: Io, a: Allocator, path: []const u8) !void {
+    const bytes = try readWhole(io, a, path);
+    // Magic (4) at head + tail, plus a 4-byte footer length between them.
+    try testing.expect(bytes.len > 12);
+    try testing.expectEqualStrings("PAR1", bytes[0..4]);
+    try testing.expectEqualStrings("PAR1", bytes[bytes.len - 4 ..]);
+}
+
+test "exportParquet writes the three framed Parquet tables from a seeded log and state" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = testing.io;
+
+    const state_path = ".test-fable-monitor-export-happy-state.jsonl.zst";
+    const log_path = ".test-fable-monitor-export-happy-log.jsonl";
+    const out_dir = ".test-fable-monitor-export-happy-out";
+
+    // Clean up every artifact the log/state/parquet paths can create. The log
+    // path spawns sibling `.segments`/`.manifest*` files and per-path locks.
+    defer {
+        Io.Dir.cwd().deleteTree(io, out_dir) catch {};
+        Io.Dir.cwd().deleteTree(io, log_path ++ ".segments") catch {};
+        Io.Dir.cwd().deleteFile(io, log_path) catch {};
+        Io.Dir.cwd().deleteFile(io, log_path ++ ".manifest") catch {};
+        Io.Dir.cwd().deleteFile(io, log_path ++ ".manifest.backup") catch {};
+        Io.Dir.cwd().deleteFile(io, log_path ++ ".lock") catch {};
+        Io.Dir.cwd().deleteFile(io, state_path) catch {};
+        Io.Dir.cwd().deleteFile(io, state_path ++ ".lock") catch {};
+    }
+
+    var ctx = Context{
+        .io = io,
+        .arena = a,
+        .state_path = state_path,
+        .log_path = log_path,
+        .notify_cmd = null,
+        .observed_at = "2026-07-04T00:00:00Z",
+        .epoch_ms = 1_000,
+    };
+
+    // Seed a small observation log through the real durable append path.
+    const seeded = [_]Event{
+        .{
+            .observed_at = "2026-07-04T00:00:00Z",
+            .epoch_ms = 1_000,
+            .source_id = "federal_register",
+            .source_label = "Federal Register",
+            .source_kind = "document_watch",
+            .event = events.ev_new_document,
+            .document_number = "2026-001",
+            .title = "Sample Rule",
+            .publication_date = "2026-07-04",
+            .url = "https://example.test/doc",
+            .detail = "seed",
+            .tier = 1,
+            .confidence = "high",
+            .event_identity = "fr:2026-001",
+            .published_at = "2026-07-04",
+            .published_epoch_ms = 2_000,
+            .fetch_ms = 42,
+            .http_status = 200,
+        },
+        .{
+            .observed_at = "2026-07-04T00:00:00Z",
+            .epoch_ms = 1_000,
+            .source_id = "anthropic_news",
+            .source_label = "Anthropic News",
+            .source_kind = "feed_watch",
+            .event = events.ev_baseline,
+            .http_status = 304,
+        },
+    };
+    try events.appendLog(io, a, log_path, &seeded, 10_000);
+
+    // Seed a small state file through the real save path.
+    const st = state.State{
+        .federal_register_seen = @constCast(&[_][]const u8{ "2026-001", "2026-002" }),
+        .keyword_hashes = @constCast(&[_]state.State.KeywordHash{
+            .{ .id = "anthropic_news", .hash = "deadbeef" },
+            .{ .id = "policy_page", .hash = "c0ffee" },
+        }),
+    };
+    try state.saveState(&ctx, st);
+
+    // Run the export into a fresh output directory.
+    try exportParquet(&ctx, out_dir);
+
+    // All three tables must exist and be well-framed Parquet.
+    try expectParquetFile(io, a, out_dir ++ "/events.parquet");
+    try expectParquetFile(io, a, out_dir ++ "/state_seen.parquet");
+    try expectParquetFile(io, a, out_dir ++ "/state_keyword_hashes.parquet");
+}
+
+test "exportParquet tolerates absent inputs and still creates the output dir" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = testing.io;
+
+    // Point at paths that do not exist: readLog and loadState both error, and
+    // export.zig catches those to log-and-skip rather than aborting the run.
+    const state_path = ".test-fable-monitor-export-empty-state.jsonl.zst";
+    const log_path = ".test-fable-monitor-export-empty-log.jsonl";
+    const out_dir = ".test-fable-monitor-export-empty-out";
+
+    defer {
+        Io.Dir.cwd().deleteTree(io, out_dir) catch {};
+        // The shared-lock acquisition on the missing log still touches a lock
+        // sibling; clean it up defensively.
+        Io.Dir.cwd().deleteFile(io, log_path ++ ".lock") catch {};
+        Io.Dir.cwd().deleteFile(io, state_path ++ ".lock") catch {};
+    }
+
+    var ctx = Context{
+        .io = io,
+        .arena = a,
+        .state_path = state_path,
+        .log_path = log_path,
+        .notify_cmd = null,
+        .observed_at = "2026-07-04T00:00:00Z",
+        .epoch_ms = 1_000,
+    };
+
+    // Must not error and must not crash with both inputs missing.
+    try exportParquet(&ctx, out_dir);
+
+    // The output directory is created up front, before any source is read.
+    var dir = try Io.Dir.cwd().openDir(io, out_dir, .{});
+    dir.close(io);
+
+    // No table should have been emitted, since both sources were unavailable.
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, out_dir ++ "/events.parquet", .{}));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, out_dir ++ "/state_seen.parquet", .{}));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, out_dir ++ "/state_keyword_hashes.parquet", .{}));
+}
+
+test "row projects a known set of Parquet values into a fresh slice" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const values = [_]parquet.Value{
+        .{ .str = "2026-001" },
+        .{ .int = 7 },
+    };
+    const projected = try row(a, &values);
+
+    // A distinct allocation carrying identical values.
+    try testing.expect(projected.ptr != &values);
+    try testing.expectEqual(@as(usize, 2), projected.len);
+    try testing.expectEqualStrings("2026-001", projected[0].str);
+    try testing.expectEqual(@as(i64, 7), projected[1].int);
+}

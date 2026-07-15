@@ -59,6 +59,43 @@ for kind in allowed_kinds:
     if f"`{kind}`" not in source_docs:
         errors.append(f"docs/sources.md: missing source kind {kind}")
 
+# Cross-validate the README's stated source counts against the actual config so
+# that adding/removing/toggling a source forces the README to stay in sync.
+sources = config.get("sources", [])
+total_count = len(sources)
+enabled_count = sum(1 for s in sources if isinstance(s, dict) and s.get("enabled", True) is not False)
+tier1_count = sum(1 for s in sources if isinstance(s, dict) and s.get("tier", 3) == 1)
+
+readme = (root / "README.md").read_text(encoding="utf-8")
+count_match = re.search(r"ships\s+(\d+)\s+sources\s*\((\d+)\s+enabled", readme)
+if not count_match:
+    errors.append(
+        "README.md: missing source-count sentence matching "
+        "'ships <N> sources (<M> enabled ...' "
+        f"(config has {total_count} sources, {enabled_count} enabled)"
+    )
+else:
+    stated_total = int(count_match.group(1))
+    stated_enabled = int(count_match.group(2))
+    if stated_total != total_count:
+        errors.append(
+            f"README.md: states {stated_total} sources but "
+            f"src/sources_default.json has {total_count}"
+        )
+    if stated_enabled != enabled_count:
+        errors.append(
+            f"README.md: states {stated_enabled} enabled sources but "
+            f"src/sources_default.json has {enabled_count} enabled"
+        )
+
+# Lenient tier-1 assertion: only enforced when the README uses the "four tier-1"
+# phrasing, so config/README wording drift stays a soft, non-brittle check.
+if re.search(r"four\s+tier-1", readme) and tier1_count != 4:
+    errors.append(
+        f"README.md: says 'four tier-1' but src/sources_default.json has "
+        f"{tier1_count} tier-1 sources"
+    )
+
 if errors:
     raise SystemExit("\n".join(errors))
 print("PASS: documentation links, review stamps, and source schema")

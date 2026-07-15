@@ -433,6 +433,19 @@ fn readLogLocked(io: Io, arena: Allocator, log_path: []const u8, manifest: Manif
 
 /// Read a consistent logical log. Corrupt legacy tails and isolated bad
 /// segments do not hide earlier committed history.
+///
+/// Memory: this materializes the whole logical log (base generation + every
+/// committed segment, each decompressed) into `arena` in one pass, so peak
+/// resident bytes scale with the *retained* history, not with a fixed window.
+/// That footprint is bounded, not unbounded: each on-disk component is capped
+/// at `max_log_bytes`, and automatic compaction retains only the newest
+/// `FABLE_MONITOR_MAX_EVENTS` rows (default 100_000). The two consumers are
+/// tolerant of this: `export` is a one-shot process that exits afterward, and
+/// the `serve` dashboard cache tail-caps the parse to its own small window.
+/// Before raising `FABLE_MONITOR_MAX_EVENTS` substantially on a memory-
+/// constrained host, size the ceiling deliberately (or teach the long-lived
+/// `serve` reader to stream/page), since the whole compacted set is decompressed
+/// at once under the shared log lock.
 pub fn readLog(io: Io, arena: Allocator, log_path: []const u8) ![]u8 {
     var lock = try acquireLogLock(io, arena, log_path, .shared);
     defer lock.release(io);

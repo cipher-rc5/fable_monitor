@@ -17,7 +17,7 @@ it lives in a separate process.
 
 Sources are described by a JSON config (an embedded default, overridable via
 `FABLE_MONITOR_SOURCES`) and graded into three confidence tiers. The default
-config ships 11 sources, including four tier-1 trippers. The authenticated API
+config ships 12 sources (11 enabled by default), including four tier-1 trippers. The authenticated API
 probe is skipped unless `ANTHROPIC_API_KEY` is set; three public probes remain.
 
 - **Tier 1 (decisive, lowest latency).** The public model listing and pricing
@@ -409,6 +409,13 @@ This README is the quick-start. Deeper technical documentation lives in
 - [`docs/operations.md`](docs/operations.md), SLOs, backup/restore, incidents, and retention.
 - [`docs/security.md`](docs/security.md), trust boundaries and deployment/supply-chain controls.
 - [`docs/release.md`](docs/release.md), baseline-CPU releases, verification, and rollback.
+
+## Security
+
+To report a suspected vulnerability, see [`SECURITY.md`](SECURITY.md), which
+summarizes the private reporting channel, response targets, and coordinated
+disclosure. The full vulnerability-reporting and support policy lives in
+[`docs/security-support.md`](docs/security-support.md).
 
 See [`docs/README.md`](docs/README.md) for the index and the policy that keeps
 these documents current.

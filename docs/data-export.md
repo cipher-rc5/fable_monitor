@@ -1,6 +1,6 @@
 # Reading the data & exporting to Parquet
 
-Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
+Last reviewed: 2026-07-15 · against fable-monitor 0.1.0
 
 The monitor's state file answers "what have we already seen?" but it is a
 *snapshot*, not a history, it is overwritten every run. To make the monitor's
@@ -146,6 +146,32 @@ poll time). Decompressed, each line looks like:
 
 The v2 fields default to empty/0, so rows written by older builds parse
 unchanged and older readers ignore the extra columns.
+
+### Schema versioning and compatibility
+
+The JSON contracts the monitor emits carry an explicit version suffix in their
+`schema` field, using a `name/N` shape: the observation/delivery event is
+`fable-monitor.event/1`, and the readiness check is `fable-monitor.preflight/1`.
+The state inspection and recovery JSON shapes (`state inspect`, `state recover`,
+`state rebaseline`) are covered by the same policy; they identify their payload
+by stable `status`/`action` keys rather than an unbounded field set.
+
+- The integer after the slash is a **stable major version**. Within one major,
+  changes are **additive and backward-compatible**: new fields may be appended,
+  but existing fields keep their name, type, and meaning.
+- A **breaking change** (removing or renaming a field, changing a field's type,
+  or changing the meaning of an existing value) **bumps the integer suffix**,
+  e.g. `fable-monitor.event/1` → `fable-monitor.event/2`. The two majors may be
+  emitted side by side during an overlap window.
+- **Consumers must ignore unknown fields** and **key on the version suffix**,
+  not on field presence. Match the `name/` prefix and branch on the integer;
+  treat an unrecognized major as one you do not support rather than failing on
+  extra keys. This is the same forward-compatibility rule the event columns
+  already follow (older readers ignore the v2 columns above).
+- **Deprecations are announced in the CHANGELOG / release notes** with an
+  overlap period: a field or major slated for removal is documented as deprecated
+  for at least one release before it is dropped, and where practical the old and
+  new majors are emitted together so consumers can migrate without a flag day.
 
 ### Event kinds
 

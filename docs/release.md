@@ -1,6 +1,6 @@
 # Release and rollback
 
-Last reviewed: 2026-07-14 · against fable-monitor 0.1.0
+Last reviewed: 2026-07-15 · against fable-monitor 0.1.0
 
 ## Prepare
 
@@ -42,6 +42,58 @@ commit. Stage the archive, run `preflight --json`, back up durable data, stop th
 service, replace only the binary, and restart. Verify service status, `/healthz`,
 `/readyz`, `audit`, delivery backlog, heartbeat, and one healthy poll before
 declaring deployment successful.
+
+## Verifying a release
+
+Consumer-side verification of a published `v<version>` release. Each release
+(`.github/workflows/release.yml`) attaches, per tag:
+
+- per-target archives `fable-monitor-<platform>-*.tar.gz`
+  (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`);
+- an SPDX SBOM `fable-monitor-v<version>.spdx.json`;
+- a `SHA256SUMS` manifest covering the archives and the SBOM;
+- a GitHub build-provenance attestation for the archives; and
+- keyless cosign (Sigstore) bundles `<file>.sigstore.json` for each `.tar.gz`,
+  the `.spdx.json`, and `SHA256SUMS`.
+
+Download every asset for the tag into an empty directory, then verify all three
+independent controls. Any failure means do not deploy the artifact.
+
+**(a) Checksums.** Confirm the bytes match the signed manifest:
+
+```sh
+sha256sum -c SHA256SUMS
+```
+
+**(b) Cosign signatures.** Each signed file has a sidecar bundle. The signing
+identity is this repository's release workflow, and the OIDC issuer is GitHub
+Actions. Verify the checksum manifest (and, the same way, any archive or the
+SBOM by swapping the target and its `.sigstore.json`):
+
+```sh
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/cipher-rc5/fable_monitor/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+# and, for the archive you intend to deploy:
+cosign verify-blob \
+  --bundle fable-monitor-linux-x86_64-*.tar.gz.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/cipher-rc5/fable_monitor/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  fable-monitor-linux-x86_64-*.tar.gz
+```
+
+**(c) Build-provenance attestation.** Verify the GitHub-issued attestation ties
+the archive to a workflow run in this repository (requires `gh auth login`):
+
+```sh
+gh attestation verify fable-monitor-*.tar.gz --repo cipher-rc5/fable_monitor
+```
+
+Only after all three pass should you inspect the SBOM and confirm the workflow
+run belongs to the tag's commit, then proceed to stage and deploy as above.
 
 ## Rollback
 
