@@ -122,8 +122,7 @@ pub fn run(io: Io, arena: Allocator, log_path: []const u8, args: []const [:0]con
     while (lines.next()) |line| {
         const t = std.mem.trim(u8, line, " \r\t");
         if (t.len == 0) continue;
-        const parsed = std.json.parseFromSlice(Event, arena, t, .{ .ignore_unknown_fields = true }) catch continue;
-        const e = parsed.value;
+        const e = std.json.parseFromSliceLeaky(Event, arena, t, .{ .ignore_unknown_fields = true }) catch continue;
         if (opts.source) |s| if (!std.mem.eql(u8, e.source_id, s)) continue;
         if (opts.event) |ev| if (!std.mem.eql(u8, e.event, ev)) continue;
         if (opts.relevant and !isRelevant(e.event)) continue;

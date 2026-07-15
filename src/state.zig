@@ -490,10 +490,10 @@ fn validDeliveryPayload(arena: std.mem.Allocator, payload: []const u8, identity:
         occurrence_id: []const u8,
         idempotency_key: []const u8,
     };
-    const parsed = std.json.parseFromSlice(Key, arena, payload, .{ .ignore_unknown_fields = true }) catch return false;
-    return std.mem.eql(u8, parsed.value.event_id, identity) and
-        std.mem.eql(u8, parsed.value.occurrence_id, occurrence_id) and
-        std.mem.eql(u8, parsed.value.idempotency_key, occurrence_id);
+    const key = std.json.parseFromSliceLeaky(Key, arena, payload, .{ .ignore_unknown_fields = true }) catch return false;
+    return std.mem.eql(u8, key.event_id, identity) and
+        std.mem.eql(u8, key.occurrence_id, occurrence_id) and
+        std.mem.eql(u8, key.idempotency_key, occurrence_id);
 }
 
 fn legacyOccurrenceId(arena: std.mem.Allocator, identity: []const u8, epoch_ms: i64) ![]const u8 {
@@ -1190,10 +1190,10 @@ test "recoverState restores validated backup byte-for-byte and writes audit" {
     try testing.expectEqualStrings("corrupt active bytes", quarantined);
 
     const audit_data = try Io.Dir.cwd().readFileAlloc(io, audit_path, arena, .limited(4096));
-    const audit = try std.json.parseFromSlice(RecoveryAudit, arena, audit_data, .{});
-    try testing.expectEqualStrings("recover_backup", audit.value.action);
-    try testing.expectEqual(@as(i64, 12345), audit.value.epoch_ms);
-    try testing.expectEqual(@as(u32, 4), audit.value.state_version);
+    const audit = try std.json.parseFromSliceLeaky(RecoveryAudit, arena, audit_data, .{});
+    try testing.expectEqualStrings("recover_backup", audit.action);
+    try testing.expectEqual(@as(i64, 12345), audit.epoch_ms);
+    try testing.expectEqual(@as(u32, 4), audit.state_version);
 }
 
 test "rebaselineState quarantines the active generation" {

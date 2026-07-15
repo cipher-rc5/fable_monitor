@@ -63,11 +63,10 @@ fn exportEvents(ctx: *Context, out_dir: []const u8) !void {
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) continue;
-        const parsed = std.json.parseFromSlice(Event, a, trimmed, .{ .ignore_unknown_fields = true }) catch |err| {
+        const e = std.json.parseFromSliceLeaky(Event, a, trimmed, .{ .ignore_unknown_fields = true }) catch |err| {
             log("export: skipping malformed log line ({s})", .{@errorName(err)});
             continue;
         };
-        const e = parsed.value;
         try rows.append(a, try row(a, &.{
             .{ .str = e.observed_at },
             .{ .int = e.epoch_ms },

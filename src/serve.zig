@@ -577,8 +577,8 @@ fn parseEventLog(arena: Allocator, data: []const u8) ![]Event {
     while (lines.next()) |line| {
         const t = std.mem.trim(u8, line, " \r\t");
         if (t.len == 0) continue;
-        const parsed = std.json.parseFromSlice(Event, arena, t, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
-        try list.append(arena, parsed.value);
+        const event = std.json.parseFromSliceLeaky(Event, arena, t, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch continue;
+        try list.append(arena, event);
     }
     std.mem.sort(Event, list.items, {}, lessByMs);
     return list.items;
@@ -759,6 +759,12 @@ var reader_cache_entries: [reader_cache_cap]?ReaderEntry = [_]?ReaderEntry{null}
 var reader_inflight: [reader_worker_cap]?[]u8 = [_]?[]u8{null} ** reader_worker_cap;
 var reader_mutex: Io.Mutex = .init;
 
+/// Backing allocator for the reader's manually managed, thread-crossing url and
+/// cache buffers (owned across the accept loop and detached workers, so they
+/// cannot live on a request arena). Defaults to the process allocator; tests
+/// swap in a leak-checking allocator to prove the dup/free lifecycle balances.
+var reader_alloc: std.mem.Allocator = std.heap.page_allocator;
+
 fn readerCacheGet(io: Io, a: Allocator, url: []const u8, now_ms: i64) ?[]const u8 {
     reader_mutex.lockUncancelable(io);
     defer reader_mutex.unlock(io);
@@ -774,7 +780,7 @@ fn readerCacheGet(io: Io, a: Allocator, url: []const u8, now_ms: i64) ?[]const u
 fn readerCachePut(io: Io, url: []const u8, html: []const u8, now_ms: i64) void {
     reader_mutex.lockUncancelable(io);
     defer reader_mutex.unlock(io);
-    const ga = std.heap.page_allocator;
+    const ga = reader_alloc;
     var target: usize = 0;
     var chosen = false;
     // Prefer an existing entry for this url (refresh it in place).
@@ -851,11 +857,11 @@ fn startReader(io: Io, url: []const u8) ReaderStart {
         } else if (free_slot == null) free_slot = i;
     }
     const slot = free_slot orelse return .busy;
-    const owned_url = std.heap.page_allocator.dupe(u8, url) catch return .failed;
+    const owned_url = reader_alloc.dupe(u8, url) catch return .failed;
     reader_inflight[slot] = owned_url;
     const thread = std.Thread.spawn(.{}, readerWorker, .{ io, owned_url }) catch {
         reader_inflight[slot] = null;
-        std.heap.page_allocator.free(owned_url);
+        reader_alloc.free(owned_url);
         return .failed;
     };
     thread.detach();
@@ -872,7 +878,7 @@ fn readerWorker(io: Io, url: []u8) void {
             }
         };
         reader_mutex.unlock(io);
-        std.heap.page_allocator.free(url);
+        reader_alloc.free(url);
     }
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1481,6 +1487,39 @@ test "reader work admission is bounded and nonblocking when saturated" {
     defer reader_inflight = [_]?[]u8{null} ** reader_worker_cap;
 
     try std.testing.expectEqual(ReaderStart.busy, startReader(std.testing.io, "https://example.com/article"));
+}
+
+test "reader cache dup/free lifecycle leaks nothing across evictions" {
+    // The reader cache owns its url/html buffers across the accept loop, freeing
+    // them on eviction, in-place refresh, and shutdown. Route those manual
+    // allocations through the leak-checking test allocator and drive more
+    // distinct urls than the cache holds so eviction frees run, then drain the
+    // table; testing.allocator fails the test if any dup was not freed.
+    const io = std.testing.io;
+    const saved = reader_alloc;
+    reader_alloc = std.testing.allocator;
+    defer {
+        // Drain every retained entry through the same allocator before restoring
+        // the default, so the table is empty and balanced for the next test.
+        reader_mutex.lockUncancelable(io);
+        for (&reader_cache_entries) |*slot| if (slot.*) |e| {
+            reader_alloc.free(e.url);
+            reader_alloc.free(e.html);
+            slot.* = null;
+        };
+        reader_mutex.unlock(io);
+        reader_alloc = saved;
+    }
+
+    var buf: [64]u8 = undefined;
+    // Insert well past reader_cache_cap so oldest-eviction frees fire repeatedly.
+    for (0..reader_cache_cap * 3) |i| {
+        const url = std.fmt.bufPrint(&buf, "https://example.com/a/{d}", .{i}) catch unreachable;
+        readerCachePut(io, url, "<article>body</article>", @intCast(i));
+    }
+    // Refresh an existing url in place (frees the prior url/html copies).
+    const dup = std.fmt.bufPrint(&buf, "https://example.com/a/{d}", .{reader_cache_cap * 3 - 1}) catch unreachable;
+    readerCachePut(io, dup, "<article>updated</article>", 999_999);
 }
 
 test "readiness disk threshold fails closed" {

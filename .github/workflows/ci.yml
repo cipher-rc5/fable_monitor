@@ -37,6 +37,37 @@ jobs:
           PARQUET_PYTHON: ${{ runner.temp }}/parquet-reader/bin/python
         run: bash scripts/ci.sh
 
+  memory-safety:
+    # Leak/UB detection that only works on Linux x86_64 (LeakSanitizer is
+    # unsupported on macOS arm64). The pure-Zig leak checks — the testing
+    # allocator, the OOM-failure sweep, the reader dup/free test, and the
+    # per-tick soak — run in every `zig build test`; this job adds the C/UB
+    # sanitizers over the curl/zstd interop boundary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Install runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl zstd
+
+      - name: Run tests under C/UB sanitizers with leak detection
+        env:
+          # Fail the run on any leak or sanitizer diagnostic rather than only
+          # logging it; halt on the first error for a clear signal.
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:exitcode=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: zig build test-sanitize --summary all
+
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15

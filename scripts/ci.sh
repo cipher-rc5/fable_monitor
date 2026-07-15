@@ -13,6 +13,7 @@ run() {
 
 run "Zig formatting" zig fmt --check src/ build.zig
 run "Unit tests" zig build test --summary all
+run "Unit tests (C/UB sanitizers)" zig build test-sanitize --summary all
 run "Build" zig build
 run "Restoration E2E" bash tests/e2e.sh
 run "Notify quoting" bash tests/notify_quoting.sh

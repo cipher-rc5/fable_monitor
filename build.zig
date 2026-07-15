@@ -40,6 +40,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // `zig build test-sanitize` — the same tests under the LLVM C/UB sanitizers,
+    // for the C-interop boundary (curl/zstd argv, libc calls). Zig's own leak
+    // detection already runs inside the standard test step via the testing
+    // allocator; this catches faults sanitizers see that the pure-Zig checks do
+    // not. A dedicated module keeps the default test build fast and unsanitized.
+    const sanitize_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_c = .full,
+    });
+    sanitize_module.addOptions("build_options", options);
+    const sanitize_tests = b.addTest(.{ .root_module = sanitize_module });
+    const run_sanitize_tests = b.addRunArtifact(sanitize_tests);
+    const sanitize_step = b.step("test-sanitize", "Run unit tests under C/UB sanitizers");
+    sanitize_step.dependOn(&run_sanitize_tests.step);
+
     // `zig build check` — type-check without emitting a binary (fast feedback,
     // and what an editor/LSP wants to drive).
     const check = b.addExecutable(.{

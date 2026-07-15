@@ -497,9 +497,9 @@ fn compactLocked(io: Io, arena: Allocator, log_path: []const u8, max_events: usi
     while (split.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) continue;
-        const parsed = std.json.parseFromSlice(Event, arena, trimmed, .{ .ignore_unknown_fields = true }) catch
+        const event = std.json.parseFromSliceLeaky(Event, arena, trimmed, .{ .ignore_unknown_fields = true }) catch
             return error.InvalidEventLog;
-        try rows.append(arena, parsed.value);
+        try rows.append(arena, event);
     }
     std.mem.sort(Event, rows.items, {}, struct {
         fn less(_: void, a: Event, b: Event) bool {

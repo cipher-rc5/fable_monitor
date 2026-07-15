@@ -639,16 +639,15 @@ fn evidenceAround(text: []const u8, needle: []const u8) []const u8 {
 fn detectModelList(r: *Run, src: Source, body: []const u8) !void {
     const had_prior = hasPriorModels(r.prev, src.id);
     var api_models: []const ApiModel = &.{};
-    var parsed_api: ?std.json.Parsed(ApiModelsResponse) = null;
-    defer if (parsed_api) |*parsed| parsed.deinit();
     const text = if (src.kind == .api_probe) "" else try sources_mod.extractVisibleText(r.a(), body);
     if (src.kind == .api_probe) {
-        parsed_api = std.json.parseFromSlice(ApiModelsResponse, r.a(), body, .{ .ignore_unknown_fields = true }) catch |err| {
+        // Parse into the run arena (r.a()); no owned Parsed wrapper to deinit.
+        const decoded = std.json.parseFromSliceLeaky(ApiModelsResponse, r.a(), body, .{ .ignore_unknown_fields = true }) catch |err| {
             if (err == error.OutOfMemory) return err;
             log("source '{s}': model API schema parse failed ({s})", .{ src.id, @errorName(err) });
             return error.FetchFailed;
         };
-        api_models = parsed_api.?.value.data;
+        api_models = decoded.data;
     }
 
     for (src.match) |model| {
@@ -809,15 +808,15 @@ fn str(o: ?[]const u8) []const u8 {
 /// set) decides whether one is high-signal. Relevant docs emit an advisory keyed
 /// on the document number, so the same doc seen on multiple FR feeds coalesces.
 fn detectFederalRegister(r: *Run, src: Source, body: []const u8) !void {
-    const parsed = std.json.parseFromSlice(FrResponse, r.a(), body, .{ .ignore_unknown_fields = true }) catch |err| {
+    // Parse into the run arena; no owned Parsed wrapper to deinit.
+    const decoded = std.json.parseFromSliceLeaky(FrResponse, r.a(), body, .{ .ignore_unknown_fields = true }) catch |err| {
         if (err == error.OutOfMemory) return err;
         log("source '{s}': JSON parse failed ({s})", .{ src.id, @errorName(err) });
         return error.FetchFailed;
     };
-    defer parsed.deinit();
 
-    const results = parsed.value.results orelse {
-        if (parsed.value.meta) |meta| {
+    const results = decoded.results orelse {
+        if (decoded.meta) |meta| {
             if (meta.pil_unavailability_message.len > 0) {
                 log("source '{s}': public-inspection list temporarily unavailable", .{src.id});
                 return error.SourceUnavailable;
@@ -1372,11 +1371,11 @@ fn eventSinkHasOccurrence(arena: Allocator, data: []const u8, occurrence_id: []c
     const Key = struct { occurrence_id: []const u8 = "" };
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
-        const parsed = std.json.parseFromSlice(Key, arena, line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        const key = std.json.parseFromSliceLeaky(Key, arena, line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => continue,
         };
-        if (std.mem.eql(u8, parsed.value.occurrence_id, occurrence_id)) return true;
+        if (std.mem.eql(u8, key.occurrence_id, occurrence_id)) return true;
     }
     return false;
 }
@@ -1908,24 +1907,22 @@ fn preflightSchemaValid(arena: Allocator, src: Source, body: []const u8, content
     return switch (src.kind) {
         .api_probe => blk: {
             if (!isJsonContentType(content_type)) break :blk false;
-            const parsed = std.json.parseFromSlice(ApiModelsResponse, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            _ = std.json.parseFromSliceLeaky(ApiModelsResponse, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => break :blk false,
             };
-            defer parsed.deinit();
             break :blk true;
         },
         .federal_register, .federal_register_public_inspection => blk: {
             if (!isJsonContentType(content_type)) break :blk false;
             const PreflightFrResponse = FrResponse;
-            const parsed = std.json.parseFromSlice(PreflightFrResponse, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            const decoded = std.json.parseFromSliceLeaky(PreflightFrResponse, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => break :blk false,
             };
-            defer parsed.deinit();
-            if (parsed.value.results != null) break :blk true;
+            if (decoded.results != null) break :blk true;
             if (src.kind == .federal_register_public_inspection) {
-                if (parsed.value.meta) |meta| break :blk meta.pil_unavailability_message.len > 0;
+                if (decoded.meta) |meta| break :blk meta.pil_unavailability_message.len > 0;
             }
             break :blk false;
         },
@@ -1998,6 +1995,66 @@ fn testContext(arena: Allocator, epoch_ms: i64) Context {
         .observed_at = "2026-07-04T00:00:00Z",
         .epoch_ms = epoch_ms,
     };
+}
+
+test "repeated polls do not grow memory per tick (soak)" {
+    // Guard the loop-mode memory-growth class of bug: many full poll runs, each
+    // on a per-tick arena reset between ticks, must not accumulate allocations
+    // on the backing allocator. A DebugAllocator backs the tick arena and its
+    // deinit reports any allocation that outlived every arena reset — a leak.
+    // Its Check being .ok is the assertion.
+    const io = testing.io;
+    const cwd = Io.Dir.cwd();
+    // File-based tests here run from the repo root; drive the real baseline
+    // fixtures and use the established .test-fable-monitor-* path convention for
+    // this run's state and log so nothing leaks into the tracked tree.
+    const fixtures_dir = "tests/fixtures/baseline";
+    const state_path = ".test-fable-monitor-soak-state.zst";
+    const log_path = ".test-fable-monitor-soak-log.zst";
+    defer cwd.deleteFile(io, state_path) catch {};
+    defer cwd.deleteFile(io, state_path ++ ".backup") catch {};
+    defer cwd.deleteFile(io, state_path ++ ".lock") catch {};
+    defer cwd.deleteFile(io, log_path) catch {};
+    defer cwd.deleteFile(io, log_path ++ ".lock") catch {};
+    defer cwd.deleteFile(io, log_path ++ ".manifest") catch {};
+    defer cwd.deleteFile(io, log_path ++ ".manifest.backup") catch {};
+    defer cwd.deleteTree(io, log_path ++ ".segments") catch {};
+
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
+    defer testing.expectEqual(std.heap.Check.ok, gpa.deinit()) catch @panic("soak: leak across poll ticks");
+
+    var tick_arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer tick_arena.deinit();
+
+    const opts = Options{
+        .fixtures_dir = fixtures_dir,
+        .force_all = true,
+        .only_csv = "anthropic_model_list,anthropic_pricing,anthropic_statement,fr_pi_bis",
+    };
+
+    var retained_after_first: usize = 0;
+    var i: i64 = 0;
+    while (i < 40) : (i += 1) {
+        const a = tick_arena.allocator();
+        var ctx = Context{
+            .io = io,
+            .arena = a,
+            .state_path = state_path,
+            .log_path = log_path,
+            .notify_cmd = null,
+            .observed_at = "2026-07-04T00:00:00Z",
+            .epoch_ms = 1_000 + i * 60_000,
+        };
+        // Baseline fixtures never trip, so every tick should be healthy; treat a
+        // degraded/failed outcome as a real regression rather than swallowing it.
+        try run(&ctx, opts);
+        // Mirror loop mode: reclaim the tick's arena before the next iteration.
+        _ = tick_arena.reset(.retain_capacity);
+        // After warmup, the backing allocator's live bytes must not keep growing.
+        const live = gpa.total_requested_bytes;
+        if (i == 4) retained_after_first = live;
+        if (i > 4) try testing.expect(live <= retained_after_first);
+    }
 }
 
 test "state-critical accumulator allocation failures propagate" {
