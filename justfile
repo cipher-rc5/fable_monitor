@@ -6,6 +6,8 @@
 demo_state := "/tmp/fable-monitor-demo.jsonl.zst"
 # Matching throwaway log path for the demo.
 demo_log := "/tmp/fable-monitor-demo-events.jsonl.zst"
+# Multi-platform betterleaks image digest resolved from GHCR on 2026-07-14.
+betterleaks_image := "ghcr.io/betterleaks/betterleaks@sha256:7a43a20d40be02a9c13801a6485f7bea9d9cdba512263440eae972103c5291f1"
 
 # Where the installed agent keeps its state/log data. Defaults to the macOS
 # launchd location (dist/install.sh); on the Linux deployment point it at the
@@ -33,6 +35,31 @@ test:
 fmt-check:
     zig fmt --check src/ build.zig
 
+# Scan git history for leaked credentials (matches the CI secret-scan job).
+# Uses a locally installed `betterleaks` if present, else the digest-pinned image.
+scan-secrets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v betterleaks >/dev/null 2>&1; then
+        betterleaks git "$PWD" -v --config "$PWD/.betterleaks.toml"
+    else
+        docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            {{betterleaks_image}} \
+            git /repo -v --config /repo/.betterleaks.toml
+    fi
+
+# Scan the working tree (staged + unstaged, uncommitted) for leaked credentials.
+scan-secrets-dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v betterleaks >/dev/null 2>&1; then
+        betterleaks dir "$PWD" -v --config "$PWD/.betterleaks.toml"
+    else
+        docker run --rm -v "$PWD:/repo:ro" -w /repo \
+            {{betterleaks_image}} \
+            dir /repo -v --config /repo/.betterleaks.toml
+    fi
+
 # Auto-format the source in place.
 fmt:
     zig fmt src/ build.zig
@@ -42,8 +69,26 @@ fmt:
 e2e: build
     bash tests/e2e.sh
 
-# Everything CI runs, in order. Run this before pushing.
-ci: fmt-check test build e2e
+# Exercise the notification command's hostile-input quoting behavior.
+notify-test:
+    bash tests/notify_quoting.sh
+
+# Validate installer syntax, redaction, hostile inputs, and failed-preflight rollback.
+installer-test:
+    bash tests/installers.sh
+    bash tests/env_install_preflight.sh
+
+# Export fixture data and read every Parquet table with DuckDB.
+parquet-test: build
+    bash tests/parquet_interop.sh
+
+# Static analysis for repository shell tests and operational scripts.
+shellcheck:
+    shellcheck --exclude=SC1090,SC2016 tests/*.sh scripts/*.sh dist/*.sh
+
+# Everything CI runs. PARQUET_PYTHON may select a Python environment with DuckDB.
+ci:
+    bash scripts/ci.sh
 
 # Run one real poll against throwaway state/log files (safe; won't touch real state).
 run:

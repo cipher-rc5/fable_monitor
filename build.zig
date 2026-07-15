@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        // Required by std.c calls and explicit for cross-release builds.
+        .link_libc = true,
     });
 
     // Single-source the version: read it from build.zig.zon and expose it to
