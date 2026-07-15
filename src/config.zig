@@ -5,9 +5,8 @@
 //! overridden from the environment (FABLE_MONITOR_ONLY / FABLE_MONITOR_DISABLE)
 //! so an operator can narrow coverage without editing the file.
 //!
-//! Parsing is lenient (unknown fields ignored, sensible defaults) and fails
-//! closed per source: a malformed source entry is skipped with a warning rather
-//! than aborting the load.
+//! Configuration is validated as a unit. An explicitly selected file must be
+//! readable and valid; silently falling back would hide deployment mistakes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,19 +29,17 @@ pub const Config = struct {
     version: u32 = 1,
     fast_interval_s: u32 = 45,
     slow_interval_s: u32 = 1800,
-    concurrency: u32 = 1,
     sources: []Source = &.{},
     /// Where the config came from, for the startup log line.
     origin: []const u8 = "embedded default",
 };
 
-// --- JSON shapes (parsed leniently, then converted) -------------------------
+// --- JSON shapes ------------------------------------------------------------
 
 const RawConfig = struct {
-    version: u32 = 1,
+    version: u32 = 0,
     fast_interval_s: u32 = 45,
     slow_interval_s: u32 = 1800,
-    concurrency: u32 = 1,
     sources: []RawSource = &.{},
 };
 
@@ -66,62 +63,76 @@ pub const LoadOptions = struct {
     only_csv: ?[]const u8 = null,
     /// Comma-separated source ids to force-disable.
     disable_csv: ?[]const u8 = null,
+    /// Decisive source ids that must remain fresh for health/readiness.
+    required_source_ids: []const []const u8 = &.{},
+    /// Minimum number of enabled decisive sources that must remain fresh.
+    minimum_decisive_sources: u32 = 1,
+    /// Optional runtime cadence override, used by readiness freshness checks.
+    fast_interval_override: ?u32 = null,
 };
 
-/// Load and resolve the configuration. Never fails: an unreadable or malformed
-/// external file falls back to the embedded default with a warning, so the
-/// monitor always has sources to poll.
+const ValidationError = error{
+    UnsupportedVersion,
+    InvalidInterval,
+    InvalidSource,
+    InvalidSourceUrl,
+    InvalidSourceSchema,
+    DuplicateSourceId,
+    UnknownSourceOverride,
+    InvalidRequiredSource,
+    DuplicateRequiredSource,
+    InvalidMinimumDecisiveSources,
+    NoEnabledSources,
+};
+
+/// Load and resolve the configuration. Startup configuration errors are fatal
+/// because a fallback could run a materially different monitor than requested.
 pub fn load(ctx: *Context, opts: LoadOptions) Config {
+    return loadChecked(ctx, opts) catch |err| fatalConfig(opts.sources_path orelse "embedded default", err);
+}
+
+/// Recoverable loader for preflight and automation. JSON object fields are
+/// strict: misspelled top-level or source fields are rejected by the decoder.
+pub fn loadChecked(ctx: *Context, opts: LoadOptions) !Config {
     var origin: []const u8 = "embedded default";
     const json: []const u8 = blk: {
         if (opts.sources_path) |path| {
-            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(8 * 1024 * 1024)) catch null) |bytes| {
-                origin = path;
-                break :blk bytes;
-            }
-            log("warning: could not read sources config '{s}'; using embedded default", .{path});
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(8 * 1024 * 1024));
+            origin = path;
+            break :blk bytes;
         }
         break :blk default_json;
     };
 
-    const raw = std.json.parseFromSliceLeaky(RawConfig, ctx.arena, json, .{ .ignore_unknown_fields = true }) catch |err| {
-        log("warning: sources config parse failed ({s}); using embedded default", .{@errorName(err)});
-        return loadDefault(ctx, opts) catch |e| fatalResolve(e);
-    };
-
-    return resolve(ctx.arena, raw, origin, opts) catch |e| fatalResolve(e);
+    return parseAndResolve(ctx.arena, json, origin, opts);
 }
 
-/// Running with a silently empty source list would make the monitor a no-op
-/// that looks healthy, so an allocation failure while building it is fatal:
-/// log and exit nonzero for the supervisor to catch. (The arena cannot free,
-/// so there is no recovery path.)
-fn fatalResolve(err: Allocator.Error) noreturn {
-    log("fatal: could not build source list ({s})", .{@errorName(err)});
+fn fatalConfig(origin: []const u8, err: anyerror) noreturn {
+    log("fatal: invalid sources config '{s}' ({s})", .{ origin, @errorName(err) });
     std.process.exit(1);
 }
 
-fn loadDefault(ctx: *Context, opts: LoadOptions) Allocator.Error!Config {
-    const raw = std.json.parseFromSliceLeaky(RawConfig, ctx.arena, default_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // The embedded default is a compile-time constant whose validity is
-        // pinned by a test below, so any other parse failure is a build defect.
-        else => unreachable,
-    };
-    return resolve(ctx.arena, raw, "embedded default", opts);
+fn parseAndResolve(arena: Allocator, json: []const u8, origin: []const u8, opts: LoadOptions) !Config {
+    const raw = try std.json.parseFromSliceLeaky(RawConfig, arena, json, .{});
+    return resolve(arena, raw, origin, opts);
 }
 
-fn resolve(arena: Allocator, raw: RawConfig, origin: []const u8, opts: LoadOptions) Allocator.Error!Config {
+fn resolve(arena: Allocator, raw: RawConfig, origin: []const u8, opts: LoadOptions) (Allocator.Error || ValidationError)!Config {
+    if (raw.version != 1) return error.UnsupportedVersion;
+    if (raw.fast_interval_s == 0 or raw.slow_interval_s == 0) return error.InvalidInterval;
+
     var list: std.ArrayList(Source) = .empty;
     for (raw.sources) |rs| {
-        const kind = SourceKind.fromString(rs.kind) orelse {
-            log("warning: source '{s}' has unknown kind '{s}'; skipping", .{ rs.id, rs.kind });
-            continue;
-        };
-        if (rs.id.len == 0 or rs.url.len == 0) {
-            log("warning: source with kind '{s}' missing id or url; skipping", .{rs.kind});
-            continue;
+        if (rs.id.len == 0 or rs.url.len == 0 or rs.tier < 1 or rs.tier > 3) return error.InvalidSource;
+        if (rs.poll.len != 0 and !std.mem.eql(u8, rs.poll, "fast") and !std.mem.eql(u8, rs.poll, "slow")) {
+            return error.InvalidSource;
         }
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing.id, rs.id)) return error.DuplicateSourceId;
+        }
+        const kind = SourceKind.fromString(rs.kind) orelse return error.InvalidSource;
+        if (!validProductionUrl(rs.url)) return error.InvalidSourceUrl;
+        if (!validSourceSchema(rs, kind)) return error.InvalidSourceSchema;
         const tier = Tier.fromInt(rs.tier);
         const enabled = resolveEnabled(rs.id, rs.enabled, opts);
         const src = Source{
@@ -138,14 +149,71 @@ fn resolve(arena: Allocator, raw: RawConfig, origin: []const u8, opts: LoadOptio
         try list.append(arena, src);
     }
 
+    try validateOverride(opts.only_csv, list.items);
+    try validateOverride(opts.disable_csv, list.items);
+    for (list.items) |source| {
+        if (source.enabled) break;
+    } else return error.NoEnabledSources;
+    try validateCoverage(opts, list.items);
+
     return .{
         .version = raw.version,
         .fast_interval_s = raw.fast_interval_s,
         .slow_interval_s = raw.slow_interval_s,
-        .concurrency = if (raw.concurrency == 0) 1 else raw.concurrency,
         .sources = list.items,
         .origin = origin,
     };
+}
+
+fn validProductionUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https") or uri.host == null) return false;
+    if (uri.user != null or uri.password != null) return false;
+    if (uri.port != null and uri.port.? != 443) return false;
+    for (url) |byte| if (std.ascii.isControl(byte) or byte == ' ') return false;
+    return true;
+}
+
+fn validSourceSchema(raw: RawSource, kind: SourceKind) bool {
+    if (raw.id.len == 0 or raw.kind.len == 0 or raw.url.len == 0) return false;
+    for (raw.id) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-')) return false;
+    }
+    for (raw.match) |term| if (term.len == 0) return false;
+    _ = kind;
+    return true;
+}
+
+fn validateCoverage(opts: LoadOptions, sources: []const Source) ValidationError!void {
+    var decisive_count: u32 = 0;
+    for (sources) |source| {
+        if (source.enabled and source.isDecisive()) decisive_count += 1;
+    }
+    if (opts.minimum_decisive_sources == 0 or opts.minimum_decisive_sources > decisive_count)
+        return error.InvalidMinimumDecisiveSources;
+
+    for (opts.required_source_ids, 0..) |id, i| {
+        if (id.len == 0) return error.InvalidRequiredSource;
+        for (opts.required_source_ids[0..i]) |prior| {
+            if (std.mem.eql(u8, prior, id)) return error.DuplicateRequiredSource;
+        }
+        for (sources) |source| {
+            if (!std.mem.eql(u8, source.id, id)) continue;
+            if (!source.enabled or !source.isDecisive()) return error.InvalidRequiredSource;
+            break;
+        } else return error.InvalidRequiredSource;
+    }
+}
+
+fn validateOverride(csv: ?[]const u8, sources: []const Source) ValidationError!void {
+    var it = std.mem.splitScalar(u8, csv orelse return, ',');
+    while (it.next()) |raw_id| {
+        const id = std.mem.trim(u8, raw_id, " \t");
+        if (id.len == 0) continue;
+        for (sources) |source| {
+            if (std.mem.eql(u8, source.id, id)) break;
+        } else return error.UnknownSourceOverride;
+    }
 }
 
 /// A source's match set defaults to a kind-appropriate vocabulary when the
@@ -225,13 +293,120 @@ test "resolve builds the source list and applies defaults" {
     defer arena_state.deinit();
     var raw_sources = [_]RawSource{
         .{ .id = "probe", .kind = "model_list_probe", .tier = 1, .url = "https://example.test/models" },
-        .{ .id = "bad", .kind = "no_such_kind", .url = "https://example.test/x" }, // skipped
     };
-    const cfg = try resolve(arena_state.allocator(), .{ .sources = &raw_sources }, "test", .{});
+    const cfg = try resolve(arena_state.allocator(), .{ .version = 1, .sources = &raw_sources }, "test", .{});
     try testing.expectEqual(@as(usize, 1), cfg.sources.len);
     try testing.expectEqualStrings("probe", cfg.sources[0].id);
     try testing.expectEqual(PollClass.fast, cfg.sources[0].poll);
     try testing.expectEqualStrings("test", cfg.origin);
+}
+
+test "resolve rejects invalid schema and source selections" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const valid = [_]RawSource{
+        .{ .id = "probe", .kind = "model_list_probe", .tier = 1, .url = "https://example.test/models" },
+    };
+    const two_valid = [_]RawSource{
+        valid[0],
+        .{ .id = "statement", .kind = "statement_watch", .tier = 1, .url = "https://example.test/statement" },
+    };
+    const duplicate = [_]RawSource{ valid[0], valid[0] };
+
+    try testing.expectError(error.UnsupportedVersion, resolve(arena_state.allocator(), .{ .version = 2, .sources = @constCast(&valid) }, "test", .{}));
+    try testing.expectError(error.UnsupportedVersion, resolve(arena_state.allocator(), .{ .sources = @constCast(&valid) }, "test", .{}));
+    try testing.expectError(error.InvalidInterval, resolve(arena_state.allocator(), .{ .version = 1, .fast_interval_s = 0, .sources = @constCast(&valid) }, "test", .{}));
+    try testing.expectError(error.DuplicateSourceId, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&duplicate) }, "test", .{}));
+    try testing.expectError(error.UnknownSourceOverride, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&valid) }, "test", .{ .only_csv = "missing" }));
+    try testing.expectError(error.NoEnabledSources, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&valid) }, "test", .{ .disable_csv = "probe" }));
+    try testing.expectError(error.InvalidRequiredSource, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&valid) }, "test", .{ .required_source_ids = &.{"missing"} }));
+    try testing.expectError(error.InvalidRequiredSource, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&two_valid) }, "test", .{ .required_source_ids = &.{"probe"}, .disable_csv = "probe" }));
+    try testing.expectError(error.DuplicateRequiredSource, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&valid) }, "test", .{ .required_source_ids = &.{ "probe", "probe" } }));
+    try testing.expectError(error.InvalidMinimumDecisiveSources, resolve(arena_state.allocator(), .{ .version = 1, .sources = @constCast(&valid) }, "test", .{ .minimum_decisive_sources = 2 }));
+}
+
+test "strict parser rejects every malformed critical config shape" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const invalid = [_][]const u8{
+        "",
+        "{}",
+
+        \\{"version":1,"fast_interval_s":0,"sources":[]}
+        ,
+        \\{"version":1,"sources":[]}
+        ,
+        \\{"version":1,"sources":[{}]}
+        ,
+        \\{"version":1,"soruces":[]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"http://example.com"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://user@example.com"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://example.com:8443"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"bad id","kind":"statement_watch","tier":1,"url":"https://example.com"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://example.com","matc":["x"]}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://example.com","match":[""]}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"not_a_kind","tier":1,"url":"https://example.com"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":4,"url":"https://example.com"}]}
+        ,
+        \\{"version":1,"sources":[{"id":"x","kind":"statement_watch","tier":1,"url":"https://example.com","poll":"often"}]}
+        ,
+    };
+    for (invalid) |json| {
+        try testing.expectError(error.InvalidConfig, parseInvalid(arena, json));
+    }
+}
+
+fn parseInvalid(arena: Allocator, json: []const u8) error{InvalidConfig}!void {
+    _ = parseAndResolve(arena, json, "test", .{}) catch return error.InvalidConfig;
+    return;
+}
+
+test "recoverable loader reports explicit file errors and empty files" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var ctx = Context{
+        .io = testing.io,
+        .arena = arena_state.allocator(),
+        .state_path = "",
+        .log_path = "",
+        .notify_cmd = null,
+        .observed_at = "",
+        .epoch_ms = 0,
+    };
+    const missing = ".test-fable-monitor-config-missing.json";
+    const empty = ".test-fable-monitor-config-empty.json";
+    std.Io.Dir.cwd().deleteFile(testing.io, missing) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, empty) catch {};
+
+    try testing.expectError(error.FileNotFound, loadChecked(&ctx, .{ .sources_path = missing }));
+    var file = try std.Io.Dir.cwd().createFile(testing.io, empty, .{});
+    file.close(testing.io);
+    try testing.expectError(error.InvalidConfig, loadInvalidFile(&ctx, empty));
+}
+
+test "both override lists reject typoed source IDs" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var source = [_]RawSource{.{ .id = "probe", .kind = "statement_watch", .tier = 1, .url = "https://example.test/status" }};
+    const raw = RawConfig{ .version = 1, .sources = &source };
+    try testing.expectError(error.UnknownSourceOverride, resolve(arena_state.allocator(), raw, "test", .{ .only_csv = "proeb" }));
+    try testing.expectError(error.UnknownSourceOverride, resolve(arena_state.allocator(), raw, "test", .{ .disable_csv = "proeb" }));
+}
+
+fn loadInvalidFile(ctx: *Context, path: []const u8) error{InvalidConfig}!void {
+    _ = loadChecked(ctx, .{ .sources_path = path }) catch return error.InvalidConfig;
+    return;
 }
 
 test "resolve propagates append failure instead of returning an empty config" {
@@ -241,14 +416,14 @@ test "resolve propagates append failure instead of returning an empty config" {
     };
     try testing.expectError(
         error.OutOfMemory,
-        resolve(failing.allocator(), .{ .sources = &raw_sources }, "test", .{}),
+        resolve(failing.allocator(), .{ .version = 1, .sources = &raw_sources }, "test", .{}),
     );
 }
 
 test "default config parses and yields the expected source kinds" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const raw = try std.json.parseFromSliceLeaky(RawConfig, arena_state.allocator(), default_json, .{ .ignore_unknown_fields = true });
+    const raw = try std.json.parseFromSliceLeaky(RawConfig, arena_state.allocator(), default_json, .{});
     try testing.expect(raw.sources.len >= 8);
     // At least three independent tier-1 detectors must exist (no single point of
     // failure in the decisive signal path), and a statement watcher among them.
