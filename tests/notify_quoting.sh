@@ -51,7 +51,12 @@ esac
 # 3. Fire the hook the way poll.zig does — sh -c <cmd> fable-monitor <message> —
 #    with a hostile title: a double quote and an AppleScript command injection.
 TITLE='RESTORATION: he said "hi" — '"'"'do shell script "touch '"$PWNED"'"'"'"
-PATH="$TMP/bin:/usr/bin:/bin" sh -c "$NOTIFY" fable-monitor "$TITLE"
+if PATH="$TMP/bin:/usr/bin:/bin" sh -c "$NOTIFY" fable-monitor "$TITLE"; then
+    notify_status=0
+else
+    notify_status=$?
+fi
+[ "$notify_status" -eq 0 ] || fail "notify command exited $notify_status (expected 0)"
 
 # 4. Assertions.
 [ -s "$ARGS_LOG" ] || fail "stub osascript was never invoked"
@@ -83,4 +88,4 @@ done
 # Sanity: the recorded argc matches what the stub saw.
 [ "$ARGC" = "$((${#ARGS[@]} - 1))" ] || fail "argc mismatch: $ARGC vs $((${#ARGS[@]} - 1))"
 
-echo "PASS: notify payload arrives as data (1 argv item, unevaluated) — argc=$ARGC"
+echo "PASS: notify payload arrives as data (1 argv item, unevaluated); argc=$ARGC"
