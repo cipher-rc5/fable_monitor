@@ -5,6 +5,92 @@
 //! `config.zig`, which produces `Source` values described by this module.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const html = @import("html.zig");
+
+/// Extract text a user could reasonably see from an HTML model listing. In
+/// addition to comments and executable/style content, preformatted examples are
+/// omitted: documentation examples are mentions, not listing evidence.
+/// A separator is inserted at every element boundary so adjacent nodes cannot
+/// manufacture or merge an identifier.
+pub fn extractVisibleText(arena: Allocator, body: []const u8) ![]u8 {
+    var filtered: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < body.len) {
+        if (std.mem.startsWith(u8, body[i..], "<!--")) {
+            i = if (std.mem.indexOfPos(u8, body, i + 4, "-->")) |end| end + 3 else body.len;
+            try filtered.append(arena, ' ');
+            continue;
+        }
+        if (body[i] != '<') {
+            try filtered.append(arena, body[i]);
+            i += 1;
+            continue;
+        }
+
+        const end = htmlTagEnd(body, i) orelse {
+            try filtered.append(arena, body[i]);
+            i += 1;
+            continue;
+        };
+        const name = htmlTagName(body[i + 1 .. end]);
+        const closing = firstNonSpace(body[i + 1 .. end]) == '/';
+        if (!closing and isNonEvidenceElement(name)) {
+            i = skipElement(body, end + 1, name);
+            try filtered.append(arena, ' ');
+            continue;
+        }
+        try filtered.appendSlice(arena, body[i .. end + 1]);
+        try filtered.append(arena, ' ');
+        i = end + 1;
+    }
+    return html.normalizeHtml(arena, filtered.items);
+}
+
+fn htmlTagEnd(body: []const u8, start: usize) ?usize {
+    var quote: u8 = 0;
+    var i = start + 1;
+    while (i < body.len) : (i += 1) {
+        if (quote != 0) {
+            if (body[i] == quote) quote = 0;
+        } else if (body[i] == '\'' or body[i] == '"') {
+            quote = body[i];
+        } else if (body[i] == '>') return i;
+    }
+    return null;
+}
+
+fn firstNonSpace(s: []const u8) u8 {
+    for (s) |c| if (!std.ascii.isWhitespace(c)) return c;
+    return 0;
+}
+
+fn htmlTagName(tag: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < tag.len and (std.ascii.isWhitespace(tag[start]) or tag[start] == '/')) start += 1;
+    var end = start;
+    while (end < tag.len and (std.ascii.isAlphanumeric(tag[end]) or tag[end] == '-')) end += 1;
+    return tag[start..end];
+}
+
+fn isNonEvidenceElement(name: []const u8) bool {
+    inline for (.{ "script", "style", "template", "noscript", "pre", "samp" }) |excluded| {
+        if (std.ascii.eqlIgnoreCase(name, excluded)) return true;
+    }
+    return false;
+}
+
+fn skipElement(body: []const u8, after_open: usize, name: []const u8) usize {
+    var i = after_open;
+    while (i < body.len) {
+        const lt = std.mem.indexOfScalarPos(u8, body, i, '<') orelse return body.len;
+        const end = htmlTagEnd(body, lt) orelse return body.len;
+        const tag = body[lt + 1 .. end];
+        if (firstNonSpace(tag) == '/' and std.ascii.eqlIgnoreCase(htmlTagName(tag), name)) return end + 1;
+        i = end + 1;
+    }
+    return body.len;
+}
 
 /// Keywords that mark a fetched page or document as relevant. Case-insensitive.
 /// Used as the default `match` set for federal_register and keyword_watch
@@ -57,6 +143,10 @@ pub const negation_markers = [_][]const u8{
 /// a genuinely clean hit.
 pub const negation_window = 40;
 
+/// Maximum distance between restoration language and a controlled model
+/// reference on an unstructured statement page.
+pub const restoration_window = 160;
+
 /// True iff `needle` occurs in `text` at least once *outside* a negation /
 /// suspension context. `text` must already be normalized (lowercased,
 /// whitespace-collapsed; see `html.normalizeHtml`). A hit is disqualified when
@@ -78,6 +168,50 @@ pub fn presentOutsideNegation(text: []const u8, needle: []const u8) bool {
         const lo = pos -| negation_window;
         const hi = @min(text.len, pos + needle.len + negation_window);
         if (!containsMarker(text[lo..hi])) return true;
+    }
+    return false;
+}
+
+/// Exact identifier matching for model IDs. Unlike restoration stems, both
+/// boundaries reject identifier characters so longer IDs cannot alias a target.
+pub fn presentExactOutsideNegation(text: []const u8, needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, needle)) |pos| {
+        start = pos + needle.len;
+        if (!hasTokenBoundaries(text, pos, needle.len)) continue;
+        const lo = pos -| negation_window;
+        const hi = @min(text.len, pos + needle.len + negation_window);
+        if (!containsMarker(text[lo..hi])) return true;
+    }
+    return false;
+}
+
+fn hasTokenBoundaries(text: []const u8, pos: usize, len: usize) bool {
+    if (pos > 0 and isIdentifierByte(text[pos - 1])) return false;
+    if (pos + len < text.len and isIdentifierByte(text[pos + len])) return false;
+    return true;
+}
+
+fn isIdentifierByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.';
+}
+
+/// Require an un-negated restoration term to be associated with a controlled
+/// model reference in the same bounded text window.
+pub fn restorationNearModel(text: []const u8, term: []const u8) bool {
+    const refs = [_][]const u8{ "claude-fable-5", "claude-mythos-5", "fable 5", "mythos 5" };
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, term)) |pos| {
+        start = pos + term.len;
+        if (pos > 0 and std.ascii.isAlphabetic(text[pos - 1])) continue;
+        const lo = pos -| negation_window;
+        const neg_hi = @min(text.len, pos + term.len + negation_window);
+        if (containsMarker(text[lo..neg_hi])) continue;
+        const ref_lo = pos -| restoration_window;
+        const ref_hi = @min(text.len, pos + term.len + restoration_window);
+        for (refs) |model| {
+            if (std.mem.indexOf(u8, text[ref_lo..ref_hi], model) != null) return true;
+        }
     }
     return false;
 }
@@ -263,10 +397,41 @@ test "presentOutsideNegation rejects negated / suspension contexts" {
     try testing.expect(p("fable 5 returns effective today", "return"));
     try testing.expect(p("reauthorization granted for fable 5", "reauthoriz"));
     try testing.expect(p("models claude-opus-4-8 claude-fable-5 claude-mythos-5", "claude-fable-5"));
-    // Tag stripping can leave a digit abutting the next listing entry; that
-    // is a real hit, unlike a letter-embedded one.
-    try testing.expect(p("claude-opus-4-8claude-fable-5", "claude-fable-5"));
     // One clean hit wins even when another occurrence is negated (beyond the
     // negation window).
     try testing.expect(p("previously not available in some regions. as of this morning, access for fable 5 is available worldwide", "available"));
+}
+
+test "exact model matching enforces both identifier boundaries" {
+    const p = presentExactOutsideNegation;
+    try testing.expect(p("<li>claude-fable-5</li>", "claude-fable-5"));
+    try testing.expect(!p("prefix-claude-fable-5", "claude-fable-5"));
+    try testing.expect(!p("claude-fable-5-preview", "claude-fable-5"));
+}
+
+test "visible model text excludes comments executable content and examples" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const text = try extractVisibleText(arena_state.allocator(),
+        \\<!-- claude-fable-5 -->
+        \\<script>window.model = "claude-fable-5";</script>
+        \\<style>.claude-fable-5 { display: block }</style>
+        \\<pre><code>curl -d '{"model":"claude-fable-5"}'</code></pre>
+        \\<p>Available models:</p><span>claude-fable-5</span>
+    );
+    try testing.expectEqualStrings("available models: claude-fable-5", text);
+}
+
+test "visible model text preserves exact boundaries between elements" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const text = try extractVisibleText(arena_state.allocator(), "<span>prefix</span><span>claude-fable-5</span><span>-preview</span>");
+    try testing.expectEqualStrings("prefix claude-fable-5 -preview", text);
+    try testing.expect(presentExactOutsideNegation(text, "claude-fable-5"));
+}
+
+test "restoration terms must be near a controlled model" {
+    try testing.expect(restorationNearModel("access to fable 5 has been restored for all customers", "restored"));
+    try testing.expect(!restorationNearModel("access has been restored. " ++ ("unrelated policy text " ** 12) ++ "fable 5 remains restricted", "restored"));
+    try testing.expect(!restorationNearModel("the archive was restored successfully", "restored"));
 }

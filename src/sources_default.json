@@ -2,14 +2,13 @@
   "version": 1,
   "fast_interval_s": 45,
   "slow_interval_s": 1800,
-  "concurrency": 1,
   "sources": [
     {
       "id": "anthropic_model_list",
       "kind": "model_list_probe",
       "tier": 1,
       "label": "Anthropic public model listing",
-      "url": "https://docs.anthropic.com/en/docs/about-claude/models/overview",
+      "url": "https://platform.claude.com/docs/en/about-claude/models/overview",
       "match": ["claude-fable-5", "claude-mythos-5"],
       "poll": "fast",
       "lead_time": "decisive: absent-to-present is live-access confirmation, not a precursor"
@@ -19,7 +18,7 @@
       "kind": "model_list_probe",
       "tier": 1,
       "label": "Anthropic public pricing listing",
-      "url": "https://www.anthropic.com/pricing",
+      "url": "https://claude.com/pricing",
       "match": ["claude-fable-5", "claude-mythos-5"],
       "poll": "fast",
       "lead_time": "decisive: independent corroborator of the model listing"
